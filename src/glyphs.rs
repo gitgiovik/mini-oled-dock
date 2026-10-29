@@ -246,6 +246,14 @@ pub fn show_desktop_shape(u: f32, v: f32) -> bool {
     frame || stem || base
 }
 
+/// "Start": four filled squares (2x2) separated by a cross-shaped empty channel, centered in the 16x16 grid.
+pub fn windows_logo_shape(u: f32, v: f32) -> bool {
+    let (l, m1, m2, r) = (edge(2.4), edge(7.4), edge(8.6), edge(13.6));
+    let in_cols = (u >= l && u <= m1) || (u >= m2 && u <= r);
+    let in_rows = (v >= l && v <= m1) || (v >= m2 && v <= r);
+    in_cols && in_rows
+}
+
 /// Center and radius of the network status badge (bottom right) and the empty halo around it.
 const NET_BADGE_CX: f32 = 12.6;
 const NET_BADGE_CY: f32 = 12.6;
@@ -436,6 +444,10 @@ mod tests {
         assert!(!power_shape(8.0, 8.8)); // empty center
         assert!(show_desktop_shape(2.2, 6.0)); // left side of the monitor
         assert!(!show_desktop_shape(8.0, 7.0)); // empty screen
+        assert!(windows_logo_shape(4.0, 4.0) && windows_logo_shape(12.0, 12.0)); // outer squares
+        // channel
+        assert!(!windows_logo_shape(8.0, 4.0) && !windows_logo_shape(4.0, 8.0) && !windows_logo_shape(8.0, 8.0));
+        assert!(!windows_logo_shape(1.0, 1.0)); // outside
         assert!(chevron_up_shape(8.0, 6.0));
         assert!(close_shape(8.0, 8.0));
         assert!(check_shape(6.5, 11.5));

@@ -16,9 +16,9 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 |---|---|---|
 | ![](docs/screenshots/popup_power.png) | ![](docs/screenshots/popup_settings.png) | ![](docs/screenshots/popup_network.png) |
 
-| Tray: choose visible icons |
-|---|
-| ![](docs/screenshots/popup_tray_customize.png) |
+| Tray: choose visible icons | Start menu |
+|---|---|
+| ![](docs/screenshots/popup_tray_customize.png) | ![](docs/screenshots/popup_start.png) |
 
 ## Features
 
@@ -33,6 +33,7 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 - Popups: notifications (with Do not disturb), audio (volume, mute, output device), calendar, network, power, settings, and an app menu (new window, pin / unpin, close).
 - Disabled features cost nothing: a hidden module has no timer, no polling and loads no system library; the network and metrics modules are polled only while the bar is visible.
 - Show desktop button.
+- Start button at the left end of the bar (before the apps): left click opens Start, right click opens a quick-links menu like the native Win+X one (Installed apps, Device Manager, Terminal (admin), PowerShell (admin), Task Manager, Settings, File Explorer, Search, Run, Sign out, ...), in Italian when the Windows display language is Italian and in English otherwise.
 - **Win key toggles the dock** (Win+other-key shortcuts still work), including over fullscreen games.
 - Auto-hide with a slide animation: the bar shows on the Win key or when the pointer touches the screen edge, and hides after 2.5 s.
 - Autostart without UAC prompts (scheduled task).
@@ -92,7 +93,7 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | `app_icon_size` | `16` | App icon size in logical px, 14-32 |
 | `app_text_size` | `13` | App name text size in logical px, 10-18 |
 | `tray_icon_size` | `16` | Tray icon size in logical px, 12-24 |
-| `module_size` | `100` | Scale of the system modules (notifications, volume, network, metrics, clock, show desktop, power) in percent, 75-150 |
+| `module_size` | `100` | Scale of the Start button and the system modules (notifications, volume, network, metrics, clock, show desktop, power) in percent, 75-150 |
 | `background` | `"#000000"` | Background colour of the bar and the popups, `"#RRGGBB"` (the old values `"black"` and `"dark"` are still accepted) |
 | `bar_opacity` | `95` | Bar background opacity in percent, 0-100 (text and icons stay opaque) |
 | `autohide` | `true` | Hide the bar when the pointer leaves it |
@@ -104,6 +105,7 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | `show_network` | `true` | Network module: Wi-Fi bars / ethernet, internet badge, details popup |
 | `show_metrics` | `false` | CPU / RAM usage module (click opens Task Manager) |
 | `show_notifications` / `show_volume` / `show_clock` / `show_desktop_button` | `true` | Show the other system modules (a hidden module costs nothing) |
+| `show_start_button` | `true` | Start button at the left end of the bar (a fixed item, not a movable module) |
 | `pinned` | `[]` | Pinned apps, in display order |
 | `names` | `{}` | Display-name overrides (key: lowercase exe name or AUMID) |
 
@@ -119,7 +121,7 @@ New-Item -Path HKLM:\SOFTWARE\mini-oled-dock -Force; Set-ItemProperty HKLM:\SOFT
 
 It is picked up within about 10 s. Set it to `0` or delete the key to turn it off. System messages (below `WM_USER`) are never forwarded to elevated windows either way.
 
-A pinned app looks like this; `launch` is an exe path or `shell:AppsFolder\<AUMID>` (list AUMIDs with `Get-StartApps`), `icon` is an optional PNG in `%ProgramData%\mini-oled-dock\icons\` (you can drop files there without admin rights; at most 4 MB, no shortcuts, links or hard links), given as a plain file name only (paths, `..`, drive letters and UNC paths are rejected). Pinning from the right-click menu fills it in for you. Apps are always started without administrator rights, through the desktop shell, even though the dock itself is elevated; if that is not possible the launch is refused rather than run elevated.
+A pinned app looks like this; `launch` is an exe path or `shell:AppsFolder\<AUMID>` (list AUMIDs with `Get-StartApps`), `icon` is an optional PNG in `%ProgramData%\mini-oled-dock\icons\` (you can drop files there without admin rights; at most 4 MB, no shortcuts, links or hard links), given as a plain file name only (paths, `..`, drive letters and UNC paths are rejected). Pinning from the right-click menu fills it in for you. Apps are always started without administrator rights, through the desktop shell, even though the dock itself is elevated; if that is not possible the launch is refused rather than run elevated. The two admin entries of the Start quick-links menu (Terminal and PowerShell) ask Explorer to start them with the `runas` verb, so they go through the normal UAC prompt; the dock never uses its own token.
 
 ```jsonc
 { "key": "c:\\program files\\discord\\discord.exe", "name": "Discord",

@@ -51,6 +51,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // Child module via #[path]: this way main.rs does not need to declare it.
 #[path = "popup_app.rs"]
 pub(crate) mod popup_app;
+#[path = "popup_start.rs"]
+pub(crate) mod popup_start;
 
 use crate::audio::{OutputDevice, VolumeState};
 use crate::log;
@@ -85,6 +87,8 @@ pub enum PopupKind {
     AppMenu = 6,
     Network = 7,
     Settings = 8,
+    /// Quick-links menu of the Start button (right click).
+    Start = 9,
 }
 
 /// Where to open the popup. SCREEN coordinates in physical pixels.
@@ -645,6 +649,7 @@ fn make_content(kind: PopupKind, volume: VolumeState, net: crate::net::NetInfo) 
         PopupKind::AppMenu => popup_app::new(take_app_info().unwrap_or_default()),
         PopupKind::Network => crate::popup_network::new(net),
         PopupKind::Settings => crate::popup_settings::new(),
+        PopupKind::Start => popup_start::new(),
     }
 }
 

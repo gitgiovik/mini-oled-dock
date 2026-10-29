@@ -85,6 +85,39 @@ pub struct ResolveApp {
     pub custom_icon: Option<String>,
 }
 
+/// Tools the Start menu can start elevated (via UAC, see `ShellRequest::LaunchAdmin`). A closed set:
+/// the executable is a constant resolved here, never a string from the config, pins or registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminTool {
+    Terminal,
+    PowerShell,
+}
+
+impl AdminTool {
+    fn exe(self) -> &'static str {
+        match self {
+            AdminTool::Terminal => "wt.exe",
+            AdminTool::PowerShell => "powershell.exe",
+        }
+    }
+}
+
+/// Verb for `IShellDispatch2::ShellExecute`. Closed on purpose: `RunAs` is built only by `launch_admin`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verb {
+    Open,
+    RunAs,
+}
+
+impl Verb {
+    fn as_str(self) -> &'static str {
+        match self {
+            Verb::Open => "open",
+            Verb::RunAs => "runas",
+        }
+    }
+}
+
 /// UI -> shell thread requests.
 #[derive(Clone, Debug)]
 pub enum ShellRequest {
@@ -93,6 +126,10 @@ pub enum ShellRequest {
     /// Launch `target` (exe path, `shell:AppsFolder\...`, `ms-settings:...`) with optional `args`.
     /// When the dock is elevated it ALWAYS runs de-elevated through the desktop shell, or not at all.
     Launch { target: String, args: Option<String> },
+    /// Start menu "(admin)" entries: asks the desktop shell (Explorer, medium integrity) to run a FIXED
+    /// tool with the `runas` verb, so Windows shows its UAC prompt. The dock's own token is never used;
+    /// without the desktop shell the launch is refused. Only this request carries `runas`.
+    LaunchAdmin(AdminTool),
     /// Change the volume by `delta_percent` points (wheel: +-`audio::WHEEL_STEP_PERCENT`).
     VolumeAdjust { delta_percent: i32 },
     /// Toggle mute.
@@ -108,6 +145,8 @@ pub enum ShellRequest {
     SetDefaultOutput { id: String },
     /// "Show desktop" (`IShellDispatch4::ToggleDesktop`, fallback Win+D with `INJECT_TAG`).
     ToggleDesktop,
+    /// "Start" button: synthetic Win press and release with `INJECT_TAG` (opens / closes the Start menu).
+    OpenStart,
     /// Network module: query the active connection -> `ShellEvent::Network`. The first request
     /// creates the `net::Querier` (libraries / COM object loaded on demand, see `net`).
     NetworkQuery,
@@ -374,6 +413,7 @@ impl Shell {
                     log!("shell: Launch '{target}' not executed: {e}");
                 }
             }
+            ShellRequest::LaunchAdmin(tool) => launch_admin(tool),
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
                 let st = self.audio.as_mut().map(|a| a.adjust(delta_percent));
@@ -411,6 +451,7 @@ impl Shell {
                 push_event(self.ui, ShellEvent::AudioOutputs(list));
             }
             ShellRequest::ToggleDesktop => toggle_desktop(),
+            ShellRequest::OpenStart => send_win_alone(),
             ShellRequest::NetworkQuery => {
                 let info = self.net.get_or_insert_with(crate::net::Querier::new).query();
                 push_event(self.ui, ShellEvent::Network(info));
@@ -1147,7 +1188,7 @@ fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
         log!("shell: Launch '{target}' args={args:?}");
         return shell_execute(target, args, dir.as_deref());
     }
-    match desktop_shell_execute(target, args, dir.as_deref()) {
+    match desktop_shell_execute(target, args, dir.as_deref(), Verb::Open) {
         Ok(()) => {
             log!("shell: Launch '{target}' args={args:?} via the desktop shell (de-elevated)");
             Ok(())
@@ -1156,6 +1197,18 @@ fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
             log!("shell: de-elevated launch of '{target}' failed ({e}): REFUSED, never launching elevated");
             Err(format!("de-elevated launch failed: {e}"))
         }
+    }
+}
+
+/// Starts `tool` elevated the way the native "Terminal (Admin)" does: Explorer (medium integrity) runs
+/// it with the `runas` verb and Windows shows the UAC prompt. Same path whether or not the dock is
+/// elevated; if the desktop shell is unavailable the launch is REFUSED (no direct ShellExecute or
+/// CreateProcess, so the dock's token is never inherited). A cancelled prompt is handled by Explorer.
+fn launch_admin(tool: AdminTool) {
+    let exe = tool.exe();
+    match desktop_shell_execute(exe, None, None, Verb::RunAs) {
+        Ok(()) => log!("shell: LaunchAdmin '{exe}' via the desktop shell (runas, UAC prompt)"),
+        Err(e) => log!("shell: LaunchAdmin '{exe}' through the desktop shell failed ({e}): REFUSED"),
     }
 }
 
@@ -1207,9 +1260,10 @@ impl Drop for OwnedVariant {
 /// process is NOT elevated even when the dock is:
 /// `IShellWindows::FindWindowSW(CSIDL_DESKTOP)` -> `IServiceProvider::QueryService(SID_STopLevelBrowser)`
 /// -> `IShellBrowser::QueryActiveShellView` -> `IShellView::GetItemObject(SVGIO_BACKGROUND)`
-/// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., "open", SW_SHOWNORMAL)`.
+/// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., verb, SW_SHOWNORMAL)`.
+/// `verb` is `Open` for every launch except `launch_admin` (`RunAs`: Explorer asks UAC, not the dock).
 /// Must be called on a COM STA thread (the shell thread).
-fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>) -> windows::core::Result<()> {
+fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> windows::core::Result<()> {
     // SAFETY: COM STA initialized on the shell thread; every interface below is used only on this
     // thread and released when it goes out of scope. The VARIANTs passed by pointer outlive the calls.
     unsafe {
@@ -1228,7 +1282,7 @@ fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>) -> w
             &BSTR::from(file),
             &OwnedVariant::opt_bstr(args).0,
             &OwnedVariant::opt_bstr(dir).0,
-            &OwnedVariant::bstr("open").0,
+            &OwnedVariant::bstr(verb.as_str()).0,
             &OwnedVariant::i4(SW_SHOWNORMAL.0).0,
         )
     }
@@ -1271,6 +1325,29 @@ fn send_win_d() {
     let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if n as usize != inputs.len() {
         log!("shell: SendInput Win+D: sent {n}/{}", inputs.len());
+    }
+}
+
+/// Win pressed and released alone with `dwExtraInfo = INJECT_TAG`: the keyboard hook lets it through and
+/// Windows toggles the Start menu (the physical Win key is swallowed by the hook, it only toggles the dock).
+fn send_win_alone() {
+    let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_LWIN,
+                wScan: 0,
+                dwFlags: flags | KEYEVENTF_EXTENDEDKEY,
+                time: 0,
+                dwExtraInfo: crate::hook::INJECT_TAG,
+            },
+        },
+    };
+    let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+    // SAFETY: `inputs` is a valid array of INPUT with the declared size.
+    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if n as usize != inputs.len() {
+        log!("shell: SendInput Win: sent {n}/{}", inputs.len());
     }
 }
 

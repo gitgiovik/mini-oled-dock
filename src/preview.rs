@@ -285,9 +285,11 @@ fn mock_net() -> NetInfo {
 /// Moves the app items of `layout` as in the middle of a drag: Steam (app 1) is lifted and hovers
 /// over the gap that opened between Firefox and VS Code, Firefox already slid into Steam's old place.
 fn mock_drag(layout: &mut render::Layout) {
+    // The Start button, when on, comes first: the apps begin at the first App item.
+    let b = layout.items.iter().position(|i| matches!(i.id, ItemId::App(_))).unwrap_or(0);
     let order = [0usize, 2, 1, 3]; // base indices in their new visual order (slot 2 = the gap)
-    let w: Vec<i32> = (0..4).map(|k| layout.items[k].rect.right - layout.items[k].rect.left).collect();
-    let x0 = layout.items[0].rect.left;
+    let w: Vec<i32> = (0..4).map(|k| layout.items[b + k].rect.right - layout.items[b + k].rect.left).collect();
+    let x0 = layout.items[b].rect.left;
     let mut x = x0;
     let mut lefts = [0i32; 4];
     for k in order {
@@ -297,8 +299,8 @@ fn mock_drag(layout: &mut render::Layout) {
     // The dragged item floats a little to the right of the open gap, following the cursor.
     lefts[1] += w[1] / 10;
     for k in 0..4 {
-        layout.items[k].rect.left = lefts[k];
-        layout.items[k].rect.right = lefts[k] + w[k];
+        layout.items[b + k].rect.left = lefts[k];
+        layout.items[b + k].rect.right = lefts[k] + w[k];
     }
 }
 
@@ -319,6 +321,7 @@ fn render_bar(
     STYLE.with(|s| s.get())(&mut cfg);
     let sizes = BarSizes::from_config(&cfg);
     let modules = render::visible_modules(&cfg);
+    let cfg_start = cfg.show_start_button;
     crate::config::set(cfg);
     if let Err(e) = render::init(m, sizes) {
         eprintln!("preview: render::init failed: {e}");
@@ -359,6 +362,7 @@ fn render_bar(
         },
         plate: None,
         modules: &modules,
+        start_button: cfg_start,
         lift: None,
         hover,
         max_width: m.px(1920 - 2 * render::EDGE_MARGIN),
@@ -510,6 +514,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             windows: 2,
             can_launch: true,
         }),
+        "popup_start" => crate::popup::popup_start::preview_new(),
         "popup_tray" | "popup_tray_customize" => {
             let ic = mock_icons(m, BarSizes::default());
             let bmps: Vec<Arc<IconBitmap>> = ic.tray.into_iter().map(Arc::new).collect();
@@ -664,6 +669,7 @@ pub fn run(dir: &str) -> i32 {
             ("popup_settings_presets", 3),
             ("popup_settings_sizes", 5),
             ("popup_app", 1),
+            ("popup_start", 4),
             ("popup_tray", 1),
             ("popup_tray_customize", 2),
         ] {

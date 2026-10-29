@@ -8,6 +8,8 @@
 //!      (`EWX_REBOOT` / `EWX_POWEROFF | EWX_HYBRID_SHUTDOWN`, NEVER `EWX_FORCE`), reason
 //!      `SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED`. The taskbar is NOT restored by hand:
 //!      `WM_ENDSESSION` does it (already handled in `main`), so a cancelled shutdown does not leave it visible.
+//!  * Sign out (Start quick-links menu): `ExitWindowsEx(EWX_LOGOFF)`, no privilege needed, NEVER
+//!    `EWX_FORCE` (apps may ask to save or cancel), on the `power` thread like Restart / Shut down.
 //!  * Exit the dock: `PostMessageW(crate::hwnd(), WM_CLOSE)` = the existing clean exit (restores the
 //!    native taskbar and destroys the tray host before the `TaskbarCreated` broadcast).
 //!
@@ -21,8 +23,8 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Power::SetSuspendState;
 use windows::Win32::System::Shutdown::{
-    ExitWindowsEx, LockWorkStation, EWX_HYBRID_SHUTDOWN, EWX_POWEROFF, EWX_REBOOT, SHTDN_REASON_FLAG_PLANNED,
-    SHTDN_REASON_MAJOR_OTHER,
+    ExitWindowsEx, LockWorkStation, EWX_HYBRID_SHUTDOWN, EWX_LOGOFF, EWX_POWEROFF, EWX_REBOOT,
+    SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_OTHER,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
@@ -36,6 +38,8 @@ pub enum PowerAction {
     Lock,
     Restart,
     Shutdown,
+    /// Signs the user out (Start quick-links menu).
+    SignOut,
     /// Closes the dock (clean exit, the native taskbar comes back).
     ExitDock,
 }
@@ -56,7 +60,7 @@ pub fn run(action: PowerAction) {
                 log!("power: LockWorkStation failed: {e}");
             }
         }
-        PowerAction::Sleep | PowerAction::Restart | PowerAction::Shutdown => {
+        PowerAction::Sleep | PowerAction::Restart | PowerAction::Shutdown | PowerAction::SignOut => {
             // Throwaway thread: SetSuspendState returns only on wake-up, ExitWindowsEx may wait.
             let spawned = std::thread::Builder::new().name("power".into()).spawn(move || worker(action));
             if let Err(e) = spawned {
@@ -86,6 +90,13 @@ fn worker(action: PowerAction) {
             match r {
                 Ok(()) => log!("power: ExitWindowsEx({action:?}) accepted"),
                 Err(e) => log!("power: ExitWindowsEx({action:?}) failed: {e}"),
+            }
+        }
+        PowerAction::SignOut => {
+            // Never EWX_FORCE. SAFETY: no pointers passed; logging off needs no privilege.
+            match unsafe { ExitWindowsEx(EWX_LOGOFF, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED) } {
+                Ok(()) => log!("power: ExitWindowsEx(SignOut) accepted"),
+                Err(e) => log!("power: ExitWindowsEx(SignOut) failed: {e}"),
             }
         }
         PowerAction::Lock | PowerAction::ExitDock => {}

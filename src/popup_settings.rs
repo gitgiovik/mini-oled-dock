@@ -2,8 +2,8 @@
 //!
 //!  * Main page. Appearance: position and display mode (segmented choices drawn by hand), then
 //!    "Background ›" and "Sizes ›" (sub-pages). Behavior: auto-hide, clock seconds (switches).
-//!    Modules: one switch per system module (`config::MODULE_NAMES` mechanism) and, with the tray on,
-//!    "Choose tray icons" (switches to the tray popup in chooser mode).
+//!    Modules: the Start button switch, one switch per system module (`config::MODULE_NAMES` mechanism)
+//!    and, with the tray on, "Choose tray icons" (switches to the tray popup in chooser mode).
 //!  * Background page: preset swatches (`config::BACKGROUND_PRESETS`) plus a custom swatch that opens
 //!    a hand-drawn colour picker (saturation/value square, hue strip, preview and hex code), and the
 //!    background opacity slider (0-100 %).
@@ -135,6 +135,8 @@ fn items(c: &Config, page: Page, picker_open: bool) -> Vec<Item> {
                 Item::Toggle(Setting::AutoHide, "Auto-hide"),
                 Item::Toggle(Setting::Seconds, "Clock seconds"),
                 Item::Section("Modules"),
+                // The Start button is a fixed item at the left end of the bar, not part of `MODULE_NAMES`.
+                Item::Toggle(Setting::Module("start"), module_label("start")),
             ];
             v.extend(config::MODULE_NAMES.iter().map(|n| Item::Toggle(Setting::Module(n), module_label(n))));
             if c.show_tray {
@@ -161,7 +163,7 @@ fn items(c: &Config, page: Page, picker_open: bool) -> Vec<Item> {
     }
 }
 
-/// Row label of a `config::MODULE_NAMES` entry.
+/// Row label of a `config::MODULE_NAMES` entry (or "start").
 fn module_label(name: &str) -> &'static str {
     match name {
         "notifications" => "Notifications",
@@ -170,6 +172,7 @@ fn module_label(name: &str) -> &'static str {
         "metrics" => "System metrics",
         "clock" => "Clock",
         "show_desktop" => "Show desktop",
+        "start" => "Start button",
         "tray" => "Tray icons",
         _ => "Module",
     }

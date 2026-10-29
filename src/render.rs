@@ -266,6 +266,8 @@ pub enum ItemId {
     Notifications,
     Volume,
     Clock,
+    /// "Start" button: fixed item at the left end of the bar (see `Scene::start_button`), not a module.
+    Start,
     /// "Show desktop" button.
     ShowDesktop,
     /// Power button: opens the power popup.
@@ -420,6 +422,8 @@ pub struct Scene<'a> {
     pub plate: Option<Plate>,
     /// Visible system items, in order (`visible_modules`).
     pub modules: &'a [ItemId],
+    /// Show the Start button as the first item of the bar (`Config::show_start_button`). Not draggable.
+    pub start_button: bool,
     /// Item being dragged (its rectangle in the layout already follows the cursor).
     pub lift: Option<Lift>,
     /// Item under the mouse (or of the open popup): text and glyphs brighten.
@@ -443,7 +447,7 @@ pub struct Layout {
     pub width: i32,
     /// Bar height in physical pixels (`bar_height`).
     pub height: i32,
-    /// Items in visual order: apps, tray icons, chevron, then the visible system modules.
+    /// Items in visual order: the Start button (if shown), apps, tray icons, chevron, then the visible system modules.
     pub items: Vec<ItemRect>,
     /// X coordinate (client, physical px) of the separator between the app zone and the tray/system zone; -1 if absent
     /// (no apps).
@@ -812,6 +816,7 @@ struct SysWidths {
     volume: i32,
     clock: i32,
     desk: i32,
+    start: i32,
     power: i32,
     net: i32,
     metrics: i32,
@@ -839,7 +844,7 @@ fn sys_widths(scene: &Scene<'_>) -> SysWidths {
     } else {
         0
     };
-    SysWidths { bell, volume, clock, desk: bell, power: bell, net: bell, metrics }
+    SysWidths { bell, volume, clock, desk: bell, start: bell, power: bell, net: bell, metrics }
 }
 
 /// Labels of the two metric lines.
@@ -865,6 +870,7 @@ fn module_width(sw: &SysWidths, id: ItemId) -> i32 {
         ItemId::Volume => sw.volume,
         ItemId::Clock => sw.clock,
         ItemId::ShowDesktop => sw.desk,
+        ItemId::Start => sw.start,
         ItemId::Network => sw.net,
         ItemId::Metrics => sw.metrics,
         _ => sw.power,
@@ -965,8 +971,15 @@ fn build_layout(
     let sys_total: i32 = scene.modules.iter().map(|id| module_width(sw, *id)).sum();
     let right_total = tray_block + sys_total;
 
-    let mut items = Vec::with_capacity(scene.apps.len() + tray_count + scene.modules.len());
+    let fixed = usize::from(scene.start_button);
+    let mut items = Vec::with_capacity(fixed + scene.apps.len() + tray_count + scene.modules.len());
     let mut x = pad_bar;
+    // Start button: first item, the width of the other glyph buttons (module scale), same gap as the apps.
+    if scene.start_button {
+        let w = sw.start;
+        items.push(ItemRect { id: ItemId::Start, rect: RECT { left: x, top, right: x + w, bottom } });
+        x += w + gap;
+    }
     let mut napps = 0usize;
     for i in 0..scene.apps.len() {
         let nw = name_w.get(i).copied().unwrap_or(0);
@@ -980,9 +993,9 @@ fn build_layout(
         napps += 1;
     }
     let separator_x;
-    if napps > 0 {
-        // App side: app items have more inner air (ITEM_PAD) than tray items (TRAY_PAD); the
-        // difference is subtracted to optically centre the separator.
+    if napps > 0 || scene.start_button {
+        // App side (with no apps the separator follows the Start button): app items have more inner air (ITEM_PAD)
+        // than tray items (TRAY_PAD); the difference is subtracted to optically centre the separator.
         let app_side = (zone_gap - (item_pad - m.px(TRAY_PAD))).max(1);
         separator_x = x - gap + app_side;
         x = separator_x + sep_w + zone_gap;
@@ -1651,6 +1664,7 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                     }
                 }
                 ItemId::ShowDesktop => cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::show_desktop_shape),
+                ItemId::Start => cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::windows_logo_shape),
                 ItemId::Power => cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::power_shape),
                 ItemId::Network => {
                     let net = scene.system.net;
@@ -1735,6 +1749,59 @@ mod tests {
             assert_eq!(s.tray_px(m), m.px(SYS_ICON));
             assert_eq!(axis(m, bar_height(m, s), CONTENT_CY), m.px(CONTENT_CY));
         }
+    }
+
+    #[test]
+    fn start_button_is_the_first_item_only_when_on() {
+        let m = Metrics { dpi: 96 };
+        let sizes = BarSizes::default();
+        render_init_for_test(m, sizes);
+        let modules = [ItemId::Notifications, ItemId::Power];
+        let scene = |start_button| Scene {
+            metrics: m,
+            sizes,
+            apps: &[],
+            tray: &[],
+            overflow_enabled: false,
+            force_chevron: false,
+            bar_top: false,
+            system: SystemView {
+                volume: VolumeState { level: 0, muted: false, available: false },
+                show_volume_percent: false,
+                time: "00:00",
+                date: None,
+                bell_badge: false,
+                bell_dnd: false,
+                net: NetStatus { kind: NetKind::Ethernet, bars: 0, internet: false },
+                usage: Usage { cpu: 0, ram: 0 },
+            },
+            plate: None,
+            modules: &modules,
+            start_button,
+            lift: None,
+            hover: None,
+            max_width: 0,
+        };
+        let on = layout(&scene(true));
+        let off = layout(&scene(false));
+        assert_eq!(on.items[0].id, ItemId::Start);
+        assert_eq!(on.items.len(), off.items.len() + 1);
+        assert!(!off.items.iter().any(|i| i.id == ItemId::Start));
+        // Same width as the other glyph buttons, and everything else moves right by one slot.
+        let start = on.items[0].rect;
+        let bell = on.rect_of(ItemId::Notifications).unwrap();
+        assert_eq!(start.right - start.left, bell.right - bell.left);
+        assert!(on.width > off.width);
+        assert_eq!(on.hit_test(start.left + 1, 1), Some(ItemId::Start));
+        assert_eq!(off.hit_test(start.left + 1, 1), Some(ItemId::Notifications));
+        // With no apps the Start button still gets its separator; without it there is none.
+        assert!(on.separator_x > start.right);
+        assert_eq!(off.separator_x, -1);
+    }
+
+    /// Initialises the GDI state `layout` measures with (memory DCs only, no window).
+    fn render_init_for_test(m: Metrics, sizes: BarSizes) {
+        init(m, sizes).expect("render init");
     }
 
     #[test]

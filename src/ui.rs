@@ -22,7 +22,8 @@
 //!  * Click: apps (left, middle and right click), bell (Win+N via `SendInput` with
 //!    `hook::INJECT_TAG` in `dwExtraInfo`), volume (toggle mute / `ms-settings:apps-volume`), clock
 //!    (`ms-settings:dateandtime`), network (popup / right click `ms-settings:network`), metrics
-//!    (Task Manager).
+//!    (Task Manager), Start button (fixed item at the left end, not draggable: left click = synthetic Win press
+//!    on the shell thread, right click = quick-links popup, `popup_start`).
 //!  * System monitor (`TIMER_SYSMON`, `sysmon_sync`): network and metrics modules, polled only while
 //!    the bar is visible; a disabled module has no timer, no state and nothing loaded.
 //!  * Themed context menu (`popup::open_app_menu`, command in `WM_DOCK_APP_MENU_CMD`): Pin/Unpin
@@ -707,6 +708,7 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Power | PopupKind::Settings => Some(ItemId::Power),
         PopupKind::TrayOverflow => Some(ItemId::TrayOverflow),
         PopupKind::Network => Some(ItemId::Network),
+        PopupKind::Start => Some(ItemId::Start),
         PopupKind::AppMenu => None,
     }
 }
@@ -871,6 +873,7 @@ pub fn redraw() {
             },
             plate: None,
             modules: &modules,
+            start_button: cfg.show_start_button,
             lift: None,
             hover: st.hover.or_else(|| popup::current().and_then(item_for_popup)),
             max_width,
@@ -1655,6 +1658,7 @@ fn on_rbutton_up(lp: LPARAM) {
         }
         Some(ItemId::Volume) => launch_target_str("ms-settings:apps-volume"),
         Some(ItemId::Network) => launch_target_str("ms-settings:network"),
+        Some(ItemId::Start) => toggle_popup(PopupKind::Start, ItemId::Start),
         Some(ItemId::Tray(id)) => tray_click(id, TrayClick::Right),
         Some(ItemId::Notifications)
         | Some(ItemId::Clock)
@@ -1740,7 +1744,8 @@ fn zone_of(id: ItemId) -> Option<Zone> {
     match id {
         ItemId::App(_) => Some(Zone::Apps),
         ItemId::Tray(_) => Some(Zone::Tray),
-        ItemId::TrayOverflow => None,
+        // The Start button is fixed at the left end of the bar.
+        ItemId::TrayOverflow | ItemId::Start => None,
         ItemId::Notifications
         | ItemId::Volume
         | ItemId::Clock
@@ -2128,7 +2133,7 @@ fn launch_target(e: &Entry) -> Option<String> {
     }
 }
 
-fn launch_target_str(target: &str) {
+pub(crate) fn launch_target_str(target: &str) {
     shell_thread::request(ShellRequest::Launch { target: target.to_string(), args: None });
 }
 
@@ -2179,6 +2184,10 @@ fn click_left(id: ItemId) {
             popup::close("show desktop");
             shell_thread::request(ShellRequest::ToggleDesktop);
         }
+        ItemId::Start => {
+            popup::close("start");
+            shell_thread::request(ShellRequest::OpenStart);
+        }
         ItemId::Network => {
             if popup::is_available() {
                 toggle_popup(PopupKind::Network, id);
@@ -2196,6 +2205,11 @@ fn click_left(id: ItemId) {
 /// Win+N (notification center) with `dwExtraInfo = INJECT_TAG`: the keyboard hook lets it through.
 /// `pub` because the notifications popup also uses it ("Open notification center").
 pub fn send_win_n() {
+    send_win_key(VK_N);
+}
+
+/// Win + `vk` pressed and released with `dwExtraInfo = INJECT_TAG` (Win+N, Win+S, Win+R ...).
+pub fn send_win_key(vk: VIRTUAL_KEY) {
     let ev = |vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -2204,8 +2218,8 @@ pub fn send_win_n() {
     };
     let inputs = [
         ev(VK_LWIN, KEYEVENTF_EXTENDEDKEY),
-        ev(VK_N, KEYBD_EVENT_FLAGS(0)),
-        ev(VK_N, KEYEVENTF_KEYUP),
+        ev(vk, KEYBD_EVENT_FLAGS(0)),
+        ev(vk, KEYEVENTF_KEYUP),
         ev(VK_LWIN, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
     ];
     // SAFETY: slice of 4 initialized INPUTs; cbSize = size_of::<INPUT>() as required.
@@ -2834,6 +2848,9 @@ mod tests {
         assert_eq!(full.len(), 7);
         assert_eq!(full[0], ItemId::Metrics);
         assert_eq!(full[2], ItemId::Network);
+        // A "start" written by an earlier version is ignored: the Start button is not a module any more.
+        let with_start: Vec<String> = std::iter::once("start".to_string()).chain(old.iter().cloned()).collect();
+        assert_eq!(render::modules_from_names(&with_start), full);
         // Drag among the visible ones (metrics hidden): power moved first.
         let vis: Vec<String> =
             ["power", "notifications", "network", "volume", "clock", "show_desktop"].map(String::from).to_vec();

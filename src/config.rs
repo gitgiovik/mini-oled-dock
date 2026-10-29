@@ -181,6 +181,8 @@ pub struct Config {
     pub show_metrics: bool,
     pub show_clock: bool,
     pub show_desktop_button: bool,
+    /// Start button: fixed item at the left end of the bar (not a movable module); see `module_visible("start")`.
+    pub show_start_button: bool,
     /// Entry display: "icon_text" | "icon" | "text".
     pub display_mode: DisplayMode,
     /// Legacy "small" | "medium" | "large": migrated to the four sizes below when read, never written.
@@ -261,6 +263,7 @@ impl Default for Config {
             show_metrics: false,
             show_clock: true,
             show_desktop_button: true,
+            show_start_button: true,
             display_mode: DisplayMode::IconText,
             bar_size: None,
             app_icon_size: APP_ICON_SIZE.default,
@@ -455,8 +458,8 @@ fn render(c: &Config) -> String {
   //   app_icon_size   app icons, 14-32 px (default 16)
   //   app_text_size   app names, 10-18 px (default 13)
   //   tray_icon_size  tray icons, 12-24 px (default 16)
-  //   module_size     notifications, volume, network, metrics, clock, show desktop and power,
-  //                   75-150 % (default 100)
+  //   module_size     start button, notifications, volume, network, metrics, clock, show desktop and
+  //                   power, 75-150 % (default 100)
   // Logical pixels: the Windows display scaling is applied on top.
   "app_icon_size": {icon_size},
   "app_text_size": {text_size},
@@ -522,6 +525,9 @@ fn render(c: &Config) -> String {
   "show_clock": {show_clock},
   "show_desktop_button": {show_desk},
 
+  // Windows logo button at the left end of the bar: left click opens Start, right click the Win+X menu.
+  "show_start_button": {show_start},
+
   // Tray icons you chose to keep out of the bar (they stay in the tray popup).
   // Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces)
   // or "<exe name lowercase>#<icon id>", e.g. "discord.exe#1".
@@ -582,6 +588,7 @@ fn render(c: &Config) -> String {
         show_metrics = c.show_metrics,
         show_clock = c.show_clock,
         show_desk = c.show_desktop_button,
+        show_start = c.show_start_button,
         tray_hidden = js_block(&c.tray_hidden),
         tray_order = js_block(&c.tray_order),
         app_order = js_block(&c.app_order),
@@ -800,7 +807,9 @@ fn write_file(c: &Config) -> Result<(), String> {
 // ------------------------------------------------------------- module visibility
 
 /// Names accepted by `Config::module_visible` / `set_module_visible`: the `modules_order` names
-/// plus "tray" (`show_tray`). The power button is not listed: it is always shown.
+/// plus "tray" (`show_tray`). The power button is not listed: it is always shown. The Start button
+/// ("start", `show_start_button`) is a fixed item, not a module: the two methods accept it but it is
+/// not listed here (the settings popup adds its switch by hand).
 pub const MODULE_NAMES: [&str; 7] = ["notifications", "volume", "network", "metrics", "clock", "show_desktop", "tray"];
 
 impl Config {
@@ -812,12 +821,13 @@ impl Config {
             "metrics" => &mut self.show_metrics,
             "clock" => &mut self.show_clock,
             "show_desktop" => &mut self.show_desktop_button,
+            "start" => &mut self.show_start_button,
             "tray" => &mut self.show_tray,
             _ => return None,
         })
     }
 
-    /// true if module `name` (a `MODULE_NAMES` entry, or "power") is shown. Unknown names: true.
+    /// true if module `name` (a `MODULE_NAMES` entry, "start" or "power") is shown. Unknown names: true.
     pub fn module_visible(&self, name: &str) -> bool {
         match name {
             "notifications" => self.show_notifications,
@@ -826,12 +836,13 @@ impl Config {
             "metrics" => self.show_metrics,
             "clock" => self.show_clock,
             "show_desktop" => self.show_desktop_button,
+            "start" => self.show_start_button,
             "tray" => self.show_tray,
             _ => true,
         }
     }
 
-    /// Shows/hides module `name` (a `MODULE_NAMES` entry). false if the name is unknown.
+    /// Shows/hides module `name` (a `MODULE_NAMES` entry or "start"). false if the name is unknown.
     pub fn set_module_visible(&mut self, name: &str, on: bool) -> bool {
         match self.module_flag(name) {
             Some(f) => {
@@ -997,10 +1008,14 @@ mod tests {
             assert!(!c.module_visible(n));
         }
         assert!(!c.set_module_visible("power", false));
+        // The Start button is a fixed item: not in MODULE_NAMES, but the switch accepts it.
+        assert!(c.set_module_visible("start", false) && !c.show_start_button);
         c.show_metrics = true;
         c.show_desktop_button = false;
+        c.show_start_button = false;
         let r = render(&c);
         assert!(r.contains("\"show_network\"") && r.contains("\"show_desktop_button\": false"));
+        assert!(r.contains("\"show_start_button\": false"));
         assert_eq!(parse(&r).unwrap(), c);
     }
 
