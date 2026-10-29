@@ -1,4 +1,5 @@
 //! NOTIFICATIONS popup. Data from `notif::snapshot()`; actions with `notif::remove`,
+//! a click on a card = `ui::open_notification_app` (the app that sent it) + `notif::remove`,
 //! `notif::clear_all`, `notif::toggle_dnd`; "Open notification center" = Win+N (SendInput with
 //! `hook::INJECT_TAG`), "Notification settings" = `ms-settings:notifications` via
 //! `shell_thread::request(Launch)`. On open `notif::set_popup_open(true)`, in `closing` false.
@@ -35,10 +36,15 @@ const ICON_GAP: i32 = 6;
 const CARD_PAD: i32 = 12;
 
 /// Action to run once the popup is closed.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum After {
     WinN,
     Settings,
+    /// A card was clicked: bring up the app that sent it (AppUserModelID, display name).
+    OpenApp {
+        aumid: String,
+        app: String,
+    },
 }
 
 /// A card already laid out (texts truncated/wrapped according to the width).
@@ -367,8 +373,9 @@ impl Content for NotifPopup {
         self.hits.at(x, y)
     }
 
-    fn clickable(&self, id: u32) -> bool {
-        !(ID_CARD..ID_X).contains(&id)
+    fn clickable(&self, _id: u32) -> bool {
+        // Cards too: a click opens the app that sent the notification.
+        true
     }
 
     fn click(&mut self, id: u32) -> Reply {
@@ -400,6 +407,16 @@ impl Content for NotifPopup {
                 notif::remove(nid);
                 self.state.items.retain(|it| it.id != nid);
                 Reply::Relayout
+            }
+            i if i >= ID_CARD => {
+                let idx = (i - ID_CARD) as usize;
+                let Some(card) = self.cards.get(idx) else { return Reply::None };
+                let nid = card.id;
+                let Some(it) = self.state.items.iter().find(|it| it.id == nid) else { return Reply::None };
+                // Like Windows: a notification that was acted upon leaves the list.
+                self.after = Some(After::OpenApp { aumid: it.aumid.clone(), app: it.app.clone() });
+                notif::remove(nid);
+                Reply::Close
             }
             _ => Reply::None,
         }
@@ -435,6 +452,7 @@ impl Content for NotifPopup {
         match self.after.take() {
             Some(After::WinN) => crate::ui::send_win_n(),
             Some(After::Settings) => launch("ms-settings:notifications"),
+            Some(After::OpenApp { aumid, app }) => crate::ui::open_notification_app(&aumid, &app),
             None => {}
         }
     }

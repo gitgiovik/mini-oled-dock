@@ -8,6 +8,8 @@
 //!    Repeats and the release of that key pass through normally.
 //!  * Win up -> if `other==false` it swallows the event and posts WM_DOCK_TOGGLE
 //!    (the real work is done by the wnd_proc), otherwise it lets the release through.
+//!  * Double tap: a lone Win press starting within DOUBLE_TAP_MS of the previous lone release
+//!    posts WM_DOCK_START_MENU instead of the second WM_DOCK_TOGGLE (the first tap already toggled).
 //!  * Win auto-repeat: ignored (swallowed while the press is "pending").
 //!  * Events injected by OTHER apps (LLKHF_INJECTED without our tag): ignored,
 //!    the dock only responds to the physical Win key.
@@ -41,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PM_NOREMOVE, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-use crate::msg::{WM_DOCK_DIAG, WM_DOCK_TOGGLE, WM_DOCK_WINKEY};
+use crate::msg::{WM_DOCK_DIAG, WM_DOCK_START_MENU, WM_DOCK_TOGGLE, WM_DOCK_WINKEY};
 use crate::{hwnd, log};
 
 /// Events for WM_DOCK_WINKEY (log only).
@@ -49,12 +51,16 @@ pub const EV_PRESSED: usize = 0;
 pub const EV_ALONE: usize = 1;
 pub const EV_COMBO: usize = 2;
 pub const EV_SENDFAIL: usize = 3;
+pub const EV_DOUBLE: usize = 4;
 
 /// Marker in dwExtraInfo of the events we inject ("DOCK").
 pub const INJECT_TAG: usize = 0x4B43_4F44;
 /// Beyond this interval (ms) from the last Win event the "Win held" state is considered
 /// stuck (e.g. Win+L: the release goes to the secure desktop). Auto-repeat keeps renewing it.
 const REPEAT_WINDOW_MS: u32 = 1500;
+/// Double tap: a lone Win press that starts within this interval (ms) of the previous lone Win
+/// release posts WM_DOCK_START_MENU instead of WM_DOCK_TOGGLE.
+pub const DOUBLE_TAP_MS: u32 = 300;
 
 /// Thread message (UI -> hook): run the `reinstall` watchdog.
 const WM_HOOK_REINSTALL: u32 = WM_APP + 10;
@@ -64,6 +70,11 @@ static WIN_OTHER: AtomicBool = AtomicBool::new(false);
 static WIN_VK: AtomicU32 = AtomicU32::new(0);
 static WIN_LAST_TIME: AtomicU32 = AtomicU32::new(0);
 static HOOK_RAW: AtomicIsize = AtomicIsize::new(0);
+/// Time (`kb.time`) of the last lone Win release that toggled the dock; 0 = none (or already
+/// consumed by a double tap, so a third tap toggles again).
+static LAST_ALONE_UP: AtomicU32 = AtomicU32::new(0);
+/// true if the current Win press started within `DOUBLE_TAP_MS` of `LAST_ALONE_UP`.
+static WIN_DOUBLE: AtomicBool = AtomicBool::new(false);
 /// Experiment: if true a lone Win is swallowed but does NOT toggle the dock.
 pub static NO_TOGGLE: AtomicBool = AtomicBool::new(false);
 /// Opt-in diagnostics (`--diag`): if false `diag()` returns immediately.
@@ -242,16 +253,30 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
             WIN_DOWN.store(true, Relaxed);
             WIN_OTHER.store(false, Relaxed);
             WIN_VK.store(vk, Relaxed);
+            let last = LAST_ALONE_UP.load(Relaxed);
+            WIN_DOUBLE.store(last != 0 && kb.time.wrapping_sub(last) <= DOUBLE_TAP_MS, Relaxed);
             note(EV_PRESSED);
             return true;
         }
         if WIN_DOWN.load(Relaxed) && vk == WIN_VK.load(Relaxed) {
             WIN_DOWN.store(false, Relaxed);
             if !WIN_OTHER.load(Relaxed) {
-                note(EV_ALONE);
-                post_toggle();
+                if WIN_DOUBLE.swap(false, Relaxed) {
+                    // Second quick tap: Start menu; the next tap starts a fresh sequence.
+                    LAST_ALONE_UP.store(0, Relaxed);
+                    note(EV_DOUBLE);
+                    post_start_menu();
+                } else {
+                    // `| 1`: a real timestamp of 0 must not read as "no previous tap".
+                    LAST_ALONE_UP.store(kb.time | 1, Relaxed);
+                    note(EV_ALONE);
+                    post_toggle();
+                }
                 return true;
             }
+            // Win used in a combination: it does not count as the first tap of a double tap.
+            LAST_ALONE_UP.store(0, Relaxed);
+            WIN_DOUBLE.store(false, Relaxed);
         }
         return false;
     }
@@ -299,6 +324,13 @@ fn post_toggle() {
         return;
     }
     post(WM_DOCK_TOGGLE, 0);
+}
+
+fn post_start_menu() {
+    if NO_TOGGLE.load(Relaxed) {
+        return;
+    }
+    post(WM_DOCK_START_MENU, 0);
 }
 
 fn key_down_input(vk: u32, scan: u32, extended: bool) -> INPUT {

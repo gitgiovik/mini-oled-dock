@@ -11,11 +11,12 @@
 //!
 //! HOOKs used in other people's files (marked `PREVIEW-HOOK`): `render::snapshot_pixels`,
 //! `Surface::snapshot_pixels`, `notif::preview_set_state`, `popup_tray::preview_new`,
-//! `popup_settings::preview_new`.
+//! `popup_settings::preview_new`, `picker::preview_pixels`.
 
 use std::path::Path;
 use std::sync::Arc;
 
+use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 use crate::audio::{DeviceKind, OutputDevice, VolumeState};
@@ -28,6 +29,7 @@ use crate::popup::{Content, DataEvent};
 use crate::popup_settings::Page;
 use crate::render::{self, AppView, BarSizes, Indicator, ItemId, Lift, Metrics, Plate, Scene, SystemView, TrayIcon};
 use crate::surface::Surface;
+use crate::ui::Screen;
 
 thread_local! {
     /// Bar style of the next `render_bar` (sizes, background, opacity): applied to the config of the
@@ -234,6 +236,7 @@ fn mock_notifications() -> NotifState {
         time_ft: 0,
         time_text: time.to_string(),
         icon_key: format!("name:{app}"),
+        aumid: String::new(),
     };
     NotifState {
         access: NotifAccess::Allowed,
@@ -306,7 +309,8 @@ fn mock_drag(layout: &mut render::Layout) {
 
 /// Renders the bar with the hover plate on `hover` (if any) in the given display mode.
 /// `attention` = index of the app whose indicator is the orange "needs attention" bar.
-/// `drag` = mid-drag frame (app 1 lifted over an open gap).
+/// `drag` = mid-drag frame (app 1 lifted over an open gap). `top` = bar at the top of the screen.
+/// Returns the pixels and the rectangle of `hover` in the bar.
 fn render_bar(
     m: Metrics,
     hover: Option<ItemId>,
@@ -314,7 +318,8 @@ fn render_bar(
     attention: Option<usize>,
     drag: bool,
     net: NetStatus,
-) -> Option<(i32, i32, Vec<u32>)> {
+    top: bool,
+) -> Option<(i32, i32, Vec<u32>, Option<RECT>)> {
     // The renderer reads the display mode from the global config snapshot (in memory only, never saved).
     // The metrics module (off by default) is switched on so the preview shows every module.
     let mut cfg = Config { display_mode: mode, show_metrics: true, ..Config::default() };
@@ -349,7 +354,7 @@ fn render_bar(
         tray: &tray,
         overflow_enabled: true,
         force_chevron: true,
-        bar_top: true,
+        bar_top: top,
         system: SystemView {
             volume: VolumeState { level: 60, muted: false, available: true },
             show_volume_percent: true,
@@ -368,6 +373,7 @@ fn render_bar(
         max_width: m.px(1920 - 2 * render::EDGE_MARGIN),
     };
     let mut layout = render::layout(&scene);
+    let hover_rect = hover.and_then(|id| layout.rect_of(id));
     if drag {
         mock_drag(&mut layout);
         scene.lift = Some(Lift { id: ItemId::App(1), alpha: crate::surface::PRESS_ALPHA as u8 });
@@ -378,7 +384,7 @@ fn render_bar(
     let out = match render::resize(layout.width, layout.height) {
         Ok(()) => {
             render::paint(&scene, &layout);
-            render::snapshot_pixels()
+            render::snapshot_pixels().map(|(w, h, px)| (w, h, px, hover_rect))
         }
         Err(e) => {
             eprintln!("preview: render::resize failed: {e}");
@@ -401,12 +407,44 @@ fn bar_png(
     drag: bool,
     net: NetStatus,
 ) -> bool {
-    let Some((bw, bh, px)) = render_bar(m, hover, mode, attention, drag, net) else { return false };
+    let Some((bw, bh, px, _)) = render_bar(m, hover, mode, attention, drag, net, true) else { return false };
     let pad = m.px(48);
     let (cw, ch) = (bw + 2 * pad, bh + m.px(150));
     let by = m.px(render::EDGE_MARGIN);
     let mut bg = wallpaper(cw, ch, by + bh / 2);
     composite(&mut bg, cw, ch, &px, bw, bh, pad, by);
+    write_png(dir, file, cw, ch, bg)
+}
+
+/// Bar at the bottom with Firefox hovered and the window picker open above it: three cards with
+/// placeholder boxes where the DWM would compose the live thumbnails.
+fn picker_png(dir: &Path, file: &str, m: Metrics) -> bool {
+    let firefox = ItemId::App(2);
+    let Some((bw, bh, px, Some(item))) =
+        render_bar(m, Some(firefox), DisplayMode::IconText, None, false, mock_net().status(), false)
+    else {
+        return false;
+    };
+    let titles = [
+        "The Rust Programming Language - Mozilla Firefox",
+        "Pull requests - GitHub - Mozilla Firefox",
+        "Weather forecast for the week ahead in Turin, Italy - Mozilla Firefox",
+    ];
+    let sources = [Some((1920, 1080)), Some((1280, 1024)), Some((2560, 1080))];
+    let Some((pw, ph, pp)) = crate::picker::preview_pixels(m, &titles, &sources, bw, Some(1)) else {
+        eprintln!("preview: picker surface failed");
+        return false;
+    };
+    let pad = m.px(48);
+    let gap = m.px(crate::popup::POPUP_GAP);
+    let margin = m.px(render::EDGE_MARGIN);
+    let (cw, ch) = (bw + 2 * pad, ph + gap + bh + margin + m.px(40));
+    let by = ch - margin - bh;
+    let cx = pad + (item.left + item.right) / 2;
+    let px_ = (cx - pw / 2).clamp(m.px(8), (cw - m.px(8) - pw).max(m.px(8)));
+    let mut bg = wallpaper(cw, ch, m.px(20));
+    composite(&mut bg, cw, ch, &px, bw, bh, pad, by);
+    composite(&mut bg, cw, ch, &pp, pw, ph, px_, by - gap - ph);
     write_png(dir, file, cw, ch, bg)
 }
 
@@ -484,7 +522,8 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             ..Default::default()
         }),
         "popup_power" => crate::popup_power::new(),
-        "popup_settings" => crate::popup_settings::new(),
+        // No displays passed: no "Screen" row, whatever monitors this machine has.
+        "popup_settings" => crate::popup_settings::preview_with_screens(Vec::new()),
         "popup_settings_navy" => {
             crate::config::set(Config {
                 background: Background(0x0E1A33),
@@ -493,7 +532,21 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
                 autohide: false,
                 ..Config::default()
             });
-            crate::popup_settings::new()
+            crate::popup_settings::preview_with_screens(Vec::new())
+        }
+        "popup_settings_screen" | "popup_settings_pointer" => {
+            // Two mock displays, bar moved to the second one (or following the pointer).
+            let monitor = if name == "popup_settings_pointer" {
+                crate::config::MONITOR_POINTER.to_string()
+            } else {
+                "\\\\.\\DISPLAY2".to_string()
+            };
+            crate::config::set(Config { monitor, ..Config::default() });
+            let d = |device: &str, label, primary| Screen { device: device.into(), label, primary };
+            crate::popup_settings::preview_with_screens(vec![
+                d("\\\\.\\DISPLAY1", "1", true),
+                d("\\\\.\\DISPLAY2", "2", false),
+            ])
         }
         "popup_settings_background" => {
             crate::config::set(Config { background: Background(0x2A1F3D), bar_opacity: 60, ..Config::default() });
@@ -515,6 +568,48 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             can_launch: true,
         }),
         "popup_start" => crate::popup::popup_start::preview_new(),
+        "popup_startmenu" | "popup_startmenu_search" => {
+            const APPS: [(&str, char, u32); 20] = [
+                ("Adobe Acrobat", 'A', 0xB30B00),
+                ("Calculator", 'C', 0x3A3A3C),
+                ("Camera", 'C', 0x2B5797),
+                ("Discord", 'D', 0x5865F2),
+                ("File Explorer", 'E', 0xE8A317),
+                ("Firefox", 'F', 0xE66000),
+                ("GIMP", 'G', 0x5C5543),
+                ("Mail", 'M', 0x0F6CBD),
+                ("Microsoft Edge", 'E', 0x0C7CD5),
+                ("Notepad", 'N', 0x2D7D9A),
+                ("Paint", 'P', 0xC239B3),
+                ("Photos", 'P', 0x0063B1),
+                ("Settings", 'S', 0x4C4A48),
+                ("Spotify", 'S', 0x1DB954),
+                ("Steam", 'S', 0x1B2838),
+                ("Terminal", 'T', 0x2F2F2F),
+                ("Visual Studio Code", 'V', 0x007ACC),
+                ("VLC media player", 'V', 0xFF8800),
+                ("Windows Security", 'W', 0x107C10),
+                ("Xbox", 'X', 0x107C10),
+            ];
+            let pins = [
+                "firefox",
+                "visual studio code",
+                "terminal",
+                "spotify",
+                "steam",
+                "discord",
+                "file explorer",
+                "settings",
+            ];
+            crate::config::set(Config {
+                start_pins: pins.iter().map(|p| p.to_string()).collect(),
+                ..Config::default()
+            });
+            let apps =
+                APPS.iter().map(|&(n, l, c)| (n.to_lowercase(), n.to_string(), mock_icon(l, c, m.px(32)))).collect();
+            let query = if name == "popup_startmenu_search" { "te" } else { "" };
+            crate::popup::popup_startmenu::preview_new(apps, query)
+        }
         "popup_tray" | "popup_tray_customize" => {
             let ic = mock_icons(m, BarSizes::default());
             let bmps: Vec<Arc<IconBitmap>> = ic.tray.into_iter().map(Arc::new).collect();
@@ -655,6 +750,8 @@ pub fn run(dir: &str) -> i32 {
             false,
             wifi,
         ));
+        crate::config::set(Config::default());
+        failures += i32::from(!picker_png(dir, &format!("popup_windows{suffix}.png"), m));
         // (name, index of the hovered control)
         for (name, nth) in [
             ("popup_notif", 1),
@@ -665,11 +762,15 @@ pub fn run(dir: &str) -> i32 {
             ("popup_power", 4),
             ("popup_settings", 3),
             ("popup_settings_navy", 2),
+            ("popup_settings_screen", 2),
+            ("popup_settings_pointer", 2),
             ("popup_settings_background", 4),
             ("popup_settings_presets", 3),
             ("popup_settings_sizes", 5),
             ("popup_app", 1),
             ("popup_start", 4),
+            ("popup_startmenu", 12),
+            ("popup_startmenu_search", 1),
             ("popup_tray", 1),
             ("popup_tray_customize", 2),
         ] {

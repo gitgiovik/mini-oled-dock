@@ -916,6 +916,21 @@ pub fn click_group(key: &str) -> ClickOutcome {
     ClickOutcome::Activated(target)
 }
 
+/// Windows of group `key` in stable order of appearance (`seq`), for the window picker. UI thread.
+pub fn windows_in_order(key: &str) -> Vec<isize> {
+    STATE.with(|s| {
+        let st = s.borrow();
+        let mut v: Vec<(isize, u64)> = st
+            .groups
+            .iter()
+            .find(|g| g.key == key)
+            .map(|g| g.windows.iter().map(|&h| (h, st.cache.get(&h).map(|e| e.seq).unwrap_or(0))).collect())
+            .unwrap_or_default();
+        v.sort_by_key(|w| w.1);
+        v.into_iter().map(|w| w.0).collect()
+    })
+}
+
 /// Sends `WM_CLOSE` (PostMessageW) to all windows of the group. UI thread.
 pub fn close_group(key: &str) {
     let wins: Vec<isize> =
@@ -954,8 +969,9 @@ fn minimize_window(h: isize) {
     log!("apps: minimize {h:#x}");
 }
 
-/// Brings `h` to the foreground; if minimized, restores it. Updates the MRU.
-fn activate_window(h: isize) {
+/// Brings `h` to the foreground; if minimized, restores it. Updates the MRU. UI thread (also used by
+/// the window picker).
+pub(crate) fn activate_window(h: isize) {
     let w = hw(h);
     // SAFETY: all the APIs accept arbitrary HWNDs and fail without UB if the window disappears.
     unsafe {

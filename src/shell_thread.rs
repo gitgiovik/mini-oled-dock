@@ -16,7 +16,7 @@
 //! The shell thread reads the config (`config::get()`) for `names` and for custom icons.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::path::Path;
@@ -45,10 +45,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_LWIN,
 };
 use windows::Win32::UI::Shell::{
-    FOLDERID_CommonPrograms, FOLDERID_Programs, IShellDispatch4, IShellItem, IShellItem2, IShellItemImageFactory,
-    IShellLinkW, SHCreateItemFromParsingName, SHDefExtractIconW, SHGetFileInfoW, SHGetImageList, SHGetKnownFolderPath,
-    Shell, ShellExecuteExW, ShellLink, KF_FLAG_DEFAULT, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, SHFILEINFOW,
-    SHGFI_SYSICONINDEX, SHIL_JUMBO, SIGDN_NORMALDISPLAY, SIIGBF_ICONONLY,
+    BHID_EnumItems, FOLDERID_CommonPrograms, FOLDERID_Programs, IEnumShellItems, IShellDispatch4, IShellItem,
+    IShellItem2, IShellItemImageFactory, IShellLinkW, SHCreateItemFromParsingName, SHDefExtractIconW, SHGetFileInfoW,
+    SHGetImageList, SHGetKnownFolderPath, Shell, ShellExecuteExW, ShellLink, KF_FLAG_DEFAULT, SEE_MASK_FLAG_NO_UI,
+    SHELLEXECUTEINFOW, SHFILEINFOW, SHGFI_SYSICONINDEX, SHIL_JUMBO, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+    SIIGBF_ICONONLY,
 };
 use windows::Win32::UI::Shell::{
     IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellWindows, SID_STopLevelBrowser, ShellWindows,
@@ -83,6 +84,17 @@ pub struct ResolveApp {
     pub icon_px: u32,
     /// `icon` field of the pin in the config (plain name inside `datadir::icons_dir()`), if present.
     pub custom_icon: Option<String>,
+}
+
+/// One app of the `shell:AppsFolder` catalog (classic programs and Store apps alike), for the Start
+/// menu opened by the Win double tap (`popup_startmenu`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartApp {
+    /// Parsing name inside AppsFolder (AUMID, `{KNOWNFOLDER}\path.exe`, ...): launched as
+    /// `shell:AppsFolder\<id>`.
+    pub id: String,
+    /// Display name, as the native Start menu shows it.
+    pub name: String,
 }
 
 /// Tools the Start menu can start elevated (via UAC, see `ShellRequest::LaunchAdmin`). A closed set:
@@ -154,6 +166,16 @@ pub enum ShellRequest {
     NetworkRelease,
     /// Volume module disabled: shuts the `AudioController` down and drops it.
     AudioRelease,
+    /// Start menu (Win double tap): enumerates `shell:AppsFolder` -> `ShellEvent::StartApps`, then
+    /// queues the icons not sent yet at `icon_px` (the ids in `first`, the menu pins, go first) as
+    /// `StartIcons` batches, which run behind every other request.
+    ListStartApps { icon_px: u32, first: Vec<String> },
+    /// One batch of Start menu icons -> `ShellEvent::StartIcons`. Queued by `ListStartApps` only;
+    /// low priority like `ResolveApp`.
+    StartIcons { icon_px: u32, ids: Vec<String> },
+    /// Click on a notification whose app has no open window: launches the app that sent it, found in
+    /// the AppsFolder catalog by AppUserModelID or display name; Win+N if it cannot be found.
+    OpenNotifApp { aumid: String, name: String },
 }
 
 /// Shell thread -> UI results (via queue + `WM_DOCK_SHELL_READY`).
@@ -169,6 +191,10 @@ pub enum ShellEvent {
     AudioOutputs(Vec<audio::OutputDevice>),
     /// Status of the active network connection (reply to `NetworkQuery`).
     Network(crate::net::NetInfo),
+    /// The AppsFolder catalog (reply to `ListStartApps`), in enumeration order.
+    StartApps(Vec<StartApp>),
+    /// Icons of Start menu apps at `icon_px` (`None` = the app has none: the menu keeps a placeholder).
+    StartIcons { icon_px: u32, icons: Vec<(String, Option<IconBitmap>)> },
 }
 
 /// Shell thread handle; passed to `stop`.
@@ -302,6 +328,10 @@ struct Shell {
     pending: VecDeque<ShellRequest>,
     /// Network module state: `None` until the first `NetworkQuery` and after `NetworkRelease`.
     net: Option<crate::net::Querier>,
+    /// Start menu icons: the size they are made at and the ids already sent or queued at that size
+    /// (a new size starts over).
+    start_px: u32,
+    start_sent: HashSet<String>,
 }
 
 fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
@@ -319,7 +349,15 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
     let _ = ready.send(tid);
     log!("shell thread started (COM STA)");
 
-    let mut shell = Shell { ui, audio: None, names: HashMap::new(), pending: VecDeque::new(), net: None };
+    let mut shell = Shell {
+        ui,
+        audio: None,
+        names: HashMap::new(),
+        pending: VecDeque::new(),
+        net: None,
+        start_px: 0,
+        start_sent: HashSet::new(),
+    };
 
     // SAFETY: thread timer (null hwnd, system-chosen id), no callback: it arrives as
     // WM_TIMER in the thread queue. Cancelled at the end.
@@ -389,7 +427,7 @@ impl Shell {
     }
 
     /// Drains the mpsc queue and works through the requests: volume/launch first, then the (slow)
-    /// resolutions, re-checking the queue after each request.
+    /// resolutions and Start menu icon batches, re-checking the queue after each request.
     fn pump(&mut self, rx: &Receiver<ShellRequest>) {
         loop {
             while let Ok(r) = rx.try_recv() {
@@ -398,7 +436,7 @@ impl Shell {
             let idx = self
                 .pending
                 .iter()
-                .position(|r| !matches!(r, ShellRequest::ResolveApp(_)))
+                .position(|r| !matches!(r, ShellRequest::ResolveApp(_) | ShellRequest::StartIcons { .. }))
                 .or(if self.pending.is_empty() { None } else { Some(0) });
             let Some(req) = idx.and_then(|i| self.pending.remove(i)) else { break };
             self.handle_request(req);
@@ -452,6 +490,7 @@ impl Shell {
             }
             ShellRequest::ToggleDesktop => toggle_desktop(),
             ShellRequest::OpenStart => send_win_alone(),
+            ShellRequest::OpenNotifApp { aumid, name } => open_notif_app(&aumid, &name),
             ShellRequest::NetworkQuery => {
                 let info = self.net.get_or_insert_with(crate::net::Querier::new).query();
                 push_event(self.ui, ShellEvent::Network(info));
@@ -462,6 +501,45 @@ impl Shell {
                     a.shutdown();
                 }
             }
+            ShellRequest::ListStartApps { icon_px, first } => self.list_start_apps(icon_px, &first),
+            ShellRequest::StartIcons { icon_px, ids } => {
+                // A batch queued for a previous size: its ids were forgotten with that size.
+                if icon_px != self.start_px {
+                    return;
+                }
+                let icons = ids
+                    .into_iter()
+                    .map(|id| {
+                        let b = start_icon(&id, icon_px);
+                        (id, b)
+                    })
+                    .collect();
+                push_event(self.ui, ShellEvent::StartIcons { icon_px, icons });
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- Start menu
+
+    /// `ListStartApps`: publishes the catalog, then queues the icons the UI does not have yet.
+    fn list_start_apps(&mut self, icon_px: u32, first: &[String]) {
+        let t = Instant::now();
+        let apps = enum_apps_folder();
+        log!("shell: Start menu: {} apps listed in {} ms", apps.len(), t.elapsed().as_millis());
+        let icon_px = icon_px.clamp(8, 256);
+        if icon_px != self.start_px {
+            self.start_px = icon_px;
+            self.start_sent.clear();
+            self.pending.retain(|r| !matches!(r, ShellRequest::StartIcons { .. }));
+        }
+        let mut missing: Vec<String> =
+            apps.iter().filter(|a| !self.start_sent.contains(&a.id)).map(|a| a.id.clone()).collect();
+        // Pins first (stable sort: the catalog order is kept inside each group).
+        missing.sort_by_key(|id| !first.iter().any(|f| f.eq_ignore_ascii_case(id)));
+        self.start_sent.extend(missing.iter().cloned());
+        push_event(self.ui, ShellEvent::StartApps(apps));
+        for chunk in missing.chunks(START_ICON_BATCH) {
+            self.pending.push_back(ShellRequest::StartIcons { icon_px, ids: chunk.to_vec() });
         }
     }
 
@@ -946,6 +1024,126 @@ fn appsfolder_name(aumid: &str) -> Option<String> {
     Some(name)
 }
 
+/// Start menu icons per `StartIcons` batch (keeps every other request responsive while ~300 load).
+const START_ICON_BATCH: usize = 8;
+/// Safety cap on the AppsFolder entries kept.
+const START_MAX_APPS: usize = 2000;
+
+/// true for the AppsFolder entries the Start menu lists: a name, not an uninstaller, not a web link.
+fn keep_start_app(id: &str, name: &str) -> bool {
+    let n = name.to_lowercase();
+    let i = id.to_lowercase();
+    !name.trim().is_empty()
+        && !n.contains("uninstall")
+        && !n.contains("disinstall")
+        && !i.starts_with("http:")
+        && !i.starts_with("https:")
+}
+
+/// Every app of `shell:AppsFolder` (desktop shortcuts of the Start Menu folders AND packaged Store
+/// apps, the same catalog as the native Start menu): `IShellItem::BindToHandler(BHID_EnumItems)`.
+/// Duplicate ids are dropped. Empty on any failure (logged).
+fn enum_apps_folder() -> Vec<StartApp> {
+    let path = HSTRING::from("shell:AppsFolder");
+    // SAFETY: COM STA initialized on the shell thread; `path` lives for the call.
+    let folder: IShellItem = match unsafe { SHCreateItemFromParsingName(&path, None::<&IBindCtx>) } {
+        Ok(f) => f,
+        Err(e) => {
+            log!("shell: Start menu: shell:AppsFolder not available: {e}");
+            return Vec::new();
+        }
+    };
+    // SAFETY: `folder` is valid; BHID_EnumItems with IEnumShellItems is the documented pairing.
+    let en: IEnumShellItems = match unsafe { folder.BindToHandler(None::<&IBindCtx>, &BHID_EnumItems) } {
+        Ok(e) => e,
+        Err(e) => {
+            log!("shell: Start menu: AppsFolder enumeration failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        let mut items: [Option<IShellItem>; 1] = [None];
+        let mut fetched = 0u32;
+        // SAFETY: `items` and `fetched` are writable and outlive the call; one element requested.
+        let hr = unsafe { en.Next(&mut items, Some(&mut fetched)) };
+        if hr.is_err() || fetched == 0 {
+            break;
+        }
+        let Some(item) = items[0].take() else { break };
+        // SAFETY: `item` is valid; the returned PWSTRs are freed by `take_pwstr`.
+        let id = unsafe { item.GetDisplayName(SIGDN_PARENTRELATIVEPARSING) }.ok().and_then(take_pwstr);
+        // SAFETY: as above.
+        let name = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }.ok().and_then(take_pwstr);
+        let (Some(id), Some(name)) = (id, name) else { continue };
+        if !keep_start_app(&id, &name) || !seen.insert(id.to_lowercase()) {
+            continue;
+        }
+        out.push(StartApp { id, name });
+        if out.len() >= START_MAX_APPS {
+            break;
+        }
+    }
+    out
+}
+
+/// Index in `apps` of the app that sent a notification: same id as the AUMID, then same display
+/// name, then (Win32 toast ids such as "FirefoxToast-308046B0AF4A39CB") the id equal to the part
+/// after the last '-'. Pure, for the tests.
+pub(crate) fn find_notif_app(apps: &[StartApp], aumid: &str, name: &str) -> Option<usize> {
+    let aumid = aumid.trim();
+    let name = name.trim();
+    if !aumid.is_empty() {
+        if let Some(i) = apps.iter().position(|a| a.id.eq_ignore_ascii_case(aumid)) {
+            return Some(i);
+        }
+    }
+    if !name.is_empty() {
+        if let Some(i) = apps.iter().position(|a| a.name.eq_ignore_ascii_case(name)) {
+            return Some(i);
+        }
+    }
+    let tail = aumid.rsplit('-').next().unwrap_or("");
+    if tail.len() >= 8 && tail.len() < aumid.len() {
+        return apps.iter().position(|a| a.id.eq_ignore_ascii_case(tail));
+    }
+    None
+}
+
+/// `ShellRequest::OpenNotifApp`.
+fn open_notif_app(aumid: &str, name: &str) {
+    let apps = enum_apps_folder();
+    match find_notif_app(&apps, aumid, name) {
+        Some(i) => {
+            let target = format!("shell:AppsFolder\\{}", apps[i].id);
+            if let Err(e) = launch(&target, None) {
+                log!("notification: launching '{}' failed: {e}, opening the notification center", apps[i].name);
+                crate::ui::send_win_n();
+            }
+        }
+        None => {
+            log!("notification: app '{name}' ({aumid}) not in the catalog, opening the notification center");
+            crate::ui::send_win_n();
+        }
+    }
+}
+
+/// Icon of the AppsFolder app `id`, `px` x `px`: `IShellItemImageFactory::GetImage(px, ICONONLY)`
+/// (asked directly at the final size: much faster than the 256 px source used for the bar).
+fn start_icon(id: &str, px: u32) -> Option<IconBitmap> {
+    let path = HSTRING::from(format!("shell:AppsFolder\\{id}"));
+    // SAFETY: COM STA initialized; `path` lives for the call.
+    let item: IShellItemImageFactory = unsafe { SHCreateItemFromParsingName(&path, None::<&IBindCtx>) }.ok()?;
+    let side = px as i32;
+    // SAFETY: `item` is valid; the returned HBITMAP is ours and is deleted below.
+    let hbm = unsafe { item.GetImage(SIZE { cx: side, cy: side }, SIIGBF_ICONONLY) }.ok()?;
+    let b = icons::hbitmap_to_bitmap(hbm).and_then(nonempty);
+    // SAFETY: bitmap owned by us, not selected into any DC.
+    let _ = unsafe { DeleteObject(HGDIOBJ(hbm.0)) };
+    nonempty(icons::resize_area(&b?, px))
+}
+
 /// Version-resource strings of an executable, read through `IShellItem2::GetString`.
 #[derive(Default)]
 struct FileInfo {
@@ -1403,6 +1601,64 @@ mod tests {
         );
         assert_eq!(pick(Some("Discord"), Some("Discord"), Some("Discord Inc."), "Discord"), Some("Discord".into()));
         assert_eq!(pick(Some("Freedom to Stream"), None, None, "stremio-shell-ng"), None);
+    }
+
+    #[test]
+    fn start_menu_filter() {
+        assert!(keep_start_app("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calculator"));
+        assert!(keep_start_app("{6D809377-6AF0-444B-8957-A3773F02200E}\\Git\\git-bash.exe", "Git Bash"));
+        assert!(!keep_start_app("{7C5A40EF}\\App\\unins000.exe", "Uninstall App"));
+        assert!(!keep_start_app("x", "Disinstalla Foo"));
+        assert!(!keep_start_app("https://example.com/", "Example website"));
+        assert!(!keep_start_app("id", "  "));
+    }
+
+    #[test]
+    fn notification_app_lookup() {
+        let app = |id: &str, name: &str| StartApp { id: id.into(), name: name.into() };
+        let apps = [
+            app("308046B0AF4A39CB", "Firefox"),
+            app("Microsoft.OutlookForWindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows", "Outlook"),
+            app("{6D809377}\\Telegram\\Telegram.exe", "Telegram"),
+        ];
+        let outlook = "microsoft.outlookforwindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows";
+        assert_eq!(find_notif_app(&apps, outlook, "Outlook (new)"), Some(1));
+        assert_eq!(find_notif_app(&apps, "FirefoxToast-308046B0AF4A39CB", ""), Some(0));
+        assert_eq!(find_notif_app(&apps, "Telegram.TelegramDesktop", "telegram"), Some(2));
+        assert_eq!(find_notif_app(&apps, "Some-App", "Unknown"), None);
+        assert_eq!(find_notif_app(&apps, "", ""), None);
+    }
+
+    /// Reads the REAL AppsFolder of this machine (run by hand: `cargo test -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn apps_folder_lists_real_apps() {
+        // SAFETY: COM STA for this test thread, paired with CoUninitialize below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let t = Instant::now();
+        let apps = enum_apps_folder();
+        let list_ms = t.elapsed().as_millis();
+        let t = Instant::now();
+        let probe: Vec<&StartApp> = apps.iter().take(40).collect();
+        let with_icon = probe.iter().filter(|a| start_icon(&a.id, 32).is_some_and(|b| b.width == 32)).count();
+        println!(
+            "AppsFolder: {} apps in {list_ms} ms; icons {with_icon}/{} in {} ms",
+            apps.len(),
+            probe.len(),
+            t.elapsed().as_millis()
+        );
+        let store = apps.iter().filter(|a| a.id.contains('!')).count();
+        println!("packaged (Store) apps: {store}, desktop: {}", apps.len() - store);
+        for a in apps.iter().take(8) {
+            println!("  {} -> {}", a.name, a.id);
+        }
+        assert!(apps.len() > 10, "too few apps: {}", apps.len());
+        assert!(store > 0, "no Store app found");
+        assert!(with_icon * 10 >= probe.len() * 8, "too many apps without an icon");
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
     }
 
     #[test]

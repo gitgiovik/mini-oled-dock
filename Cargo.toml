@@ -1,6 +1,6 @@
 [package]
 name = "dock"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.87"
 description = "A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust with no UI framework."
@@ -21,6 +21,7 @@ windows-future = "0.3.2"
 windows-collections = "0.3.2"
 windows = { version = "0.62.2", features = [
     "ApplicationModel",
+    "Data_Xml_Dom",
     "Foundation",
     "Foundation_Collections",
     "Storage_Streams",

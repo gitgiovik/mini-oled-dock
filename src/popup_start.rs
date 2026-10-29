@@ -111,7 +111,7 @@ fn label(i: usize, italian: bool) -> &'static str {
 }
 
 /// True when the user's Windows UI language is Italian (`PRIMARYLANGID == LANG_ITALIAN`).
-fn ui_is_italian() -> bool {
+pub(crate) fn ui_is_italian() -> bool {
     // SAFETY: no arguments, no preconditions; returns a LANGID.
     let langid = unsafe { GetUserDefaultUILanguage() };
     langid & 0x3ff == LANG_ITALIAN

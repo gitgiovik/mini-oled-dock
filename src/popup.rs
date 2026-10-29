@@ -43,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetTimer, SetWindowsHookExW, ShowWindow,
     UnhookWindowsHookEx, UnregisterClassW, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
     WM_XBUTTONDOWN, HTCLIENT,
-    IDC_ARROW, IDC_HAND, SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    IDC_ARROW, IDC_HAND, SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -53,6 +53,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub(crate) mod popup_app;
 #[path = "popup_start.rs"]
 pub(crate) mod popup_start;
+#[path = "popup_startmenu.rs"]
+pub(crate) mod popup_startmenu;
 
 use crate::audio::{OutputDevice, VolumeState};
 use crate::log;
@@ -89,6 +91,8 @@ pub enum PopupKind {
     Settings = 8,
     /// Quick-links menu of the Start button (right click).
     Start = 9,
+    /// Full Start menu (all apps, search, pins) opened by the Win double tap (`popup_startmenu`).
+    StartMenu = 10,
 }
 
 /// Where to open the popup. SCREEN coordinates in physical pixels.
@@ -245,6 +249,8 @@ pub(crate) enum DataEvent {
     NotifChanged,
     TrayChanged,
     Network(crate::net::NetInfo),
+    /// The Start menu catalog or some of its icons arrived (`popup_startmenu` store updated).
+    StartMenuChanged,
 }
 
 /// A popup content. Client coordinates of the popup, physical pixels. `hot`/`pressed` are the ids of the
@@ -278,6 +284,15 @@ pub(crate) trait Content {
     }
     /// Drag with the button held on `id` (volume slider).
     fn drag(&mut self, _id: u32, _x: i32, _y: i32) -> Reply {
+        Reply::None
+    }
+    /// Key pressed while the popup has the focus (`WM_KEYDOWN`, virtual-key code). `None` = not
+    /// handled: Esc then closes the popup.
+    fn key(&mut self, _vk: u16) -> Option<Reply> {
+        None
+    }
+    /// Character typed while the popup has the focus (`WM_CHAR`).
+    fn char(&mut self, _c: char) -> Reply {
         Reply::None
     }
     /// 1 s tick (`TIMER_POPUP_TICK`); also fired early by `popup::tick_soon`.
@@ -519,6 +534,21 @@ pub fn on_tray_changed() {
     dispatch(DataEvent::TrayChanged);
 }
 
+/// `ShellEvent::StartApps` reached the UI: stores the catalog and refreshes the Start menu if open.
+pub fn on_start_apps(list: Vec<crate::shell_thread::StartApp>) {
+    popup_startmenu::store_apps(list);
+    if current() == Some(PopupKind::StartMenu) {
+        dispatch(DataEvent::StartMenuChanged);
+    }
+}
+
+/// `ShellEvent::StartIcons` reached the UI: stores the icons and redraws the Start menu if open.
+pub fn on_start_icons(icon_px: u32, icons: Vec<(String, Option<crate::icons::IconBitmap>)>) {
+    if popup_startmenu::store_icons(icon_px, icons) && current() == Some(PopupKind::StartMenu) {
+        dispatch(DataEvent::StartMenuChanged);
+    }
+}
+
 /// Destroys the popup window and the surface, unregisters the class. In `cleanup`, before
 /// `ui::shutdown`. Idempotent.
 pub fn shutdown() {
@@ -650,6 +680,7 @@ fn make_content(kind: PopupKind, volume: VolumeState, net: crate::net::NetInfo) 
         PopupKind::Network => crate::popup_network::new(net),
         PopupKind::Settings => crate::popup_settings::new(),
         PopupKind::Start => popup_start::new(),
+        PopupKind::StartMenu => popup_startmenu::new(),
     }
 }
 
@@ -703,7 +734,7 @@ fn ensure_window() -> Option<HWND> {
 }
 
 /// Work area of the monitor containing `bar`.
-fn work_area(bar: &RECT) -> RECT {
+pub(crate) fn work_area(bar: &RECT) -> RECT {
     // SAFETY: `bar` is valid; MONITOR_DEFAULTTONEAREST always returns a monitor.
     let mon = unsafe { MonitorFromRect(bar, MONITOR_DEFAULTTONEAREST) };
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -715,8 +746,8 @@ fn work_area(bar: &RECT) -> RECT {
     }
 }
 
-/// Top-left corner position of a `w` x `h` popup.
-fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
+/// Top-left corner position of a `w` x `h` popup (also used by the window picker).
+pub(crate) fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
     let m = Metrics { dpi: a.dpi };
     let work = work_area(&a.bar);
     let margin = m.px(POPUP_SCREEN_MARGIN);
@@ -731,8 +762,9 @@ fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
 }
 
 fn open(kind: PopupKind, anchor: Anchor) {
-    // Any other popup closes without a fade.
+    // Any other popup closes without a fade; so does the window picker.
     close_inner("popup switch");
+    crate::picker::close("popup opened");
     let Some(hwnd) = ensure_window() else { return };
     let metrics = Metrics { dpi: anchor.dpi.max(96) };
     let surf = match Surface::new(metrics) {
@@ -928,12 +960,27 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             LRESULT(0)
         }
         WM_KEYDOWN => {
+            let handled = with(|st| st.open.as_mut().and_then(|o| o.content.key(wp.0 as u16))).flatten();
+            if let Some(reply) = handled {
+                apply(reply);
+                return LRESULT(0);
+            }
             if wp.0 == VK_ESCAPE.0 as usize {
                 close_inner("Esc");
                 return LRESULT(0);
             }
             // SAFETY: forwarding to the default handler with the same arguments.
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_CHAR => {
+            // Characters outside the BMP arrive as two surrogates: not searchable, ignored.
+            if let Some(c) = char::from_u32(wp.0 as u32) {
+                let reply = with(|st| st.open.as_mut().map(|o| o.content.char(c))).flatten();
+                if let Some(r) = reply {
+                    apply(r);
+                }
+            }
+            LRESULT(0)
         }
         WM_MOUSEMOVE => {
             on_mouse_move(hwnd, lo_i16(lp.0), hi_i16(lp.0));

@@ -1,4 +1,5 @@
-//! Drawing surface for the POPUPs: own premultiplied 32-bit DIB + `UpdateLayeredWindow`,
+//! Drawing surface for the POPUPs: own premultiplied 32-bit DIB + `UpdateLayeredWindow` (or `BitBlt` for
+//! the non-layered window picker),
 //! with the same primitives as the bar (AA rounded rect, `IconBitmap` blit, 16x16 glyphs with
 //! supersampling, hand-composited grayscale GDI text) but WITHOUT global state: each open popup has
 //! its own `Surface` (only one at a time).
@@ -13,11 +14,11 @@ use std::ffi::c_void;
 
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject, DrawTextW, GdiFlush, GetDC,
-    GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject, DrawTextW, GdiFlush,
+    GetDC, GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
     AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
     DEFAULT_CHARSET, DIB_RGB_COLORS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, HBITMAP, HDC, HFONT,
-    HGDIOBJ, LOGFONTW, TEXTMETRICW, TRANSPARENT,
+    HGDIOBJ, LOGFONTW, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
@@ -630,6 +631,16 @@ impl Surface {
         out = out.trim_end().to_string();
         out.push('\u{2026}');
         out
+    }
+
+    /// Copies the DIB as is (no alpha) onto `hdc` at `(x, y)`: for a NON-layered window drawn in
+    /// `WM_PAINT` (the window picker), where every pixel has been painted opaque.
+    pub fn copy_to(&self, hdc: HDC, x: i32, y: i32) {
+        let Some(main) = self.main.as_ref() else { return };
+        // SAFETY: `hdc` comes from BeginPaint of the caller; `dc_main` holds our DIB of `w` x `h`.
+        if let Err(e) = unsafe { BitBlt(hdc, x, y, main.w, main.h, Some(self.dc_main), 0, 0, SRCCOPY) } {
+            log!("surface: BitBlt failed: {e}");
+        }
     }
 
     /// `UpdateLayeredWindow(ULW_ALPHA)` with corner at screen `(x, y)` and constant alpha `alpha`

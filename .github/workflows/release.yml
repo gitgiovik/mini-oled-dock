@@ -1,0 +1,71 @@
+name: Release
+
+# Push a tag `vX.Y.Z` (matching `version` in Cargo.toml) to build and publish a release.
+# Release notes are read from `.github/release-notes/vX.Y.Z.md` when that file exists.
+# `workflow_dispatch` rebuilds an existing tag and replaces the assets of its release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to rebuild and publish (e.g. v1.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Tag matches Cargo.toml
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$v" -ne $env:TAG) { Write-Error "Tag $env:TAG does not match Cargo.toml version $v"; exit 1 }
+          "VERSION=$v" >> $env:GITHUB_ENV
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc -vV
+
+      - name: Tests
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/dock.exe dist/dock.exe
+          $h = (Get-FileHash dist/dock.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  dock.exe" | Out-File -Encoding ascii dist/dock.exe.sha256
+          $notes = ".github/release-notes/$env:TAG.md"
+          if (Test-Path $notes) { Copy-Item $notes dist/notes.md } else { "mini-oled-dock $env:VERSION" | Out-File -Encoding utf8 dist/notes.md }
+          "`n---`n`n**SHA256** of ``dock.exe``: ``$h``" | Add-Content -Encoding utf8 dist/notes.md
+
+      - name: Publish
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG dist/dock.exe dist/dock.exe.sha256 --clobber
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            gh release edit $env:TAG --notes-file dist/notes.md
+          } else {
+            gh release create $env:TAG dist/dock.exe dist/dock.exe.sha256 --verify-tag --title "mini-oled-dock $env:VERSION" --notes-file dist/notes.md
+          }

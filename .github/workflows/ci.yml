@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [mini-oled-dock-plus]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc -vV
+
+      # The test binary must run without a UAC prompt: DOCK_NO_MANIFEST embeds an asInvoker
+      # manifest (see build.rs). Separate target dir so the release build keeps its admin manifest.
+      - name: Tests
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked

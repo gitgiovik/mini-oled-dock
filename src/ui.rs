@@ -22,14 +22,21 @@
 //!  * Click: apps (left, middle and right click), bell (Win+N via `SendInput` with
 //!    `hook::INJECT_TAG` in `dwExtraInfo`), volume (toggle mute / `ms-settings:apps-volume`), clock
 //!    (`ms-settings:dateandtime`), network (popup / right click `ms-settings:network`), metrics
-//!    (Task Manager), Start button (fixed item at the left end, not draggable: left click = synthetic Win press
-//!    on the shell thread, right click = quick-links popup, `popup_start`).
+//!    (Task Manager), Start button (fixed item at the left end, not draggable: left click = the dock's Start menu
+//!    `popup_startmenu`, right click = quick-links popup, `popup_start`).
 //!  * System monitor (`TIMER_SYSMON`, `sysmon_sync`): network and metrics modules, polled only while
 //!    the bar is visible; a disabled module has no timer, no state and nothing loaded.
 //!  * Themed context menu (`popup::open_app_menu`, command in `WM_DOCK_APP_MENU_CMD`): Pin/Unpin
 //!    (`config::pin/unpin`), New window, Close all windows (`apps::close_group`).
 //!    While the popup is open, auto-hide is suspended (`popup::is_open`).
+//!  * Window picker (`picker`): the pointer resting `PICKER_HOVER_MS` on an app with 2+ windows
+//!    (`TIMER_HOVER_PICKER`, one-shot, armed only then) opens live thumbnails of its windows; it
+//!    also suspends auto-hide and closes on a click on the bar, another item, or the bar hiding.
 //!  * DPI: `WM_DPICHANGED`/`WM_DISPLAYCHANGE` -> recompute metrics, fonts, icons, geometry.
+//!  * Display: the bar sits on `config.monitor` (`dock_hmonitor`), the primary monitor when it is
+//!    empty or that display is not connected; `WM_DISPLAYCHANGE` moves it when displays come and go.
+//!    With `config.monitor == "pointer"` the Win key brings the bar to the display under the pointer
+//!    (`follow_pointer`), and a double tap opens the dock's Start menu there (`open_start_menu`, `popup_startmenu`).
 //!  * Auto-hide (screen edge, Win key, 2.5 s timeout); `config::effective_autohide()`
 //!    false = always visible.
 //!
@@ -37,14 +44,16 @@
 //! no `borrow` of `UI` is held across calls that pump messages (`SetWindowPos`, `present`).
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
 
+use windows::core::BOOL;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
-    MONITOR_DEFAULTTOPRIMARY,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::AttachThreadInput;
@@ -55,6 +64,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
     VK_ESCAPE, VK_F15, VK_LBUTTON, VK_LWIN, VK_RBUTTON,
 };
+use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DeregisterShellHookWindow, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
@@ -72,7 +82,8 @@ use crate::icons::IconBitmap;
 use crate::log;
 use crate::msg::{
     ID_MENU_CLOSE_ALL, ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_UNPIN, TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK,
-    TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD, WM_DOCK_SHELL_READY, WM_DOCK_VOLUME,
+    TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD,
+    WM_DOCK_SHELL_READY, WM_DOCK_VOLUME,
 };
 use crate::popup::{self, Anchor, AppMenuInfo, PopupKind};
 use crate::render::{
@@ -103,6 +114,8 @@ const HOVER_ALPHA: u8 = 20;
 const PRESS_ALPHA: u8 = 36;
 /// Debounce after `WM_DOCK_APPS_DIRTY` (ms).
 const DEBOUNCE_MS: u32 = 100;
+/// Pointer resting on an app item with 2+ windows for this long opens the window picker (ms).
+const PICKER_HOVER_MS: u32 = 400;
 /// Periodic reconciliation of the window list (ms).
 const RECONCILE_MS: u32 = 5000;
 /// Timer for the bar width animation (local id, distinct from those in `msg`).
@@ -161,14 +174,14 @@ static SHELLHOOK_MSG: AtomicU32 = AtomicU32::new(0);
 /// Tick (ms) of the last new attention request: origin of the blink phase.
 static ATTN_START: AtomicU64 = AtomicU64::new(0);
 
-/// Geometry of the dock and of the primary monitor (physical pixels, per-monitor DPI).
+/// Geometry of the dock and of its display (physical pixels, per-monitor DPI).
 #[derive(Clone, Copy, Debug)]
 pub struct Geom {
     pub x: i32,
     pub y: i32,
     pub w: i32,
     pub h: i32,
-    /// Rectangle of the primary monitor.
+    /// Rectangle of the bar's display (`config.monitor`, primary by default).
     pub mon: RECT,
 }
 
@@ -330,6 +343,11 @@ struct UiState {
 
 thread_local! {
     static GEOM: Cell<Option<Geom>> = const { Cell::new(None) };
+    /// HMONITOR (as isize) the bar was last placed on, to log a display change once.
+    static LAST_HMON: Cell<isize> = const { Cell::new(0) };
+    /// "pointer" mode (`config::MONITOR_POINTER`): HMONITOR (as isize) the Win key last brought the
+    /// bar to; 0 = not chosen yet (the display under the pointer is used).
+    static FOLLOW_HMON: Cell<isize> = const { Cell::new(0) };
     static POLL_TICKS: Cell<u32> = const { Cell::new(0) };
     static VIS: Cell<VisAnim> = const { Cell::new(VisAnim { from: 0.0, to: 0.0, start: 0, dur: 1, running: false }) };
     /// Windows that asked for attention (FlashWindowEx) and were not activated yet.
@@ -364,11 +382,11 @@ fn now_ms() -> u64 {
 
 // ------------------------------------------------------------------ public API
 
-/// Prepares the UI state BEFORE the window exists: primary monitor DPI, provisional geometry
+/// Prepares the UI state BEFORE the window exists: DPI of the bar's display, provisional geometry
 /// (centered bar, provisional width). Returns the `Geom` to create the window with.
 /// Called by `main::run` after `config::init()`.
 pub fn init() -> Result<Geom, String> {
-    let dpi = primary_dpi();
+    let dpi = dock_dpi();
     let sizes = BarSizes::from_config(&config::get());
     UI.with(|u| {
         let st = &mut *u.borrow_mut();
@@ -508,11 +526,14 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
         }
         WM_DPICHANGED => {
             let dpi = (wp.0 & 0xFFFF) as u32;
-            apply_dpi(if dpi >= 96 { dpi } else { primary_dpi() });
+            picker_cancel("display changed");
+            apply_dpi(if dpi >= 96 { dpi } else { dock_dpi() });
             Some(LRESULT(0))
         }
         WM_DISPLAYCHANGE => {
-            apply_dpi(primary_dpi());
+            // Also a display plugged in or out: the bar moves to (or back to) its chosen display.
+            picker_cancel("display changed");
+            apply_dpi(dock_dpi());
             Some(LRESULT(0))
         }
         WM_SETTINGCHANGE => {
@@ -545,6 +566,7 @@ fn on_timer(h: HWND, id: usize) -> Option<LRESULT> {
         TIMER_ATTN => on_attn_tick(h),
         TIMER_VIS => on_vis_tick(h),
         TIMER_SYSMON => sysmon_tick(),
+        TIMER_HOVER_PICKER => on_hover_picker_timer(h),
         TIMER_CLOCK => {
             if VISIBLE.load(Relaxed) && config::get().show_clock {
                 // Re-armed one-shot: SetTimer on the same id replaces the previous interval.
@@ -560,13 +582,79 @@ fn on_timer(h: HWND, id: usize) -> Option<LRESULT> {
     Some(LRESULT(0))
 }
 
-/// Win key alone (`WM_DOCK_TOGGLE`): shows or hides the dock.
+/// Win key alone (`WM_DOCK_TOGGLE`): shows or hides the dock. In "pointer" mode the bar first moves
+/// to the display under the pointer; if it was visible on another display it stays visible there.
 pub fn toggle() {
-    if VISIBLE.load(Relaxed) {
+    let moved = follow_pointer();
+    if VISIBLE.load(Relaxed) && !moved {
         hide_dock("Win alone (toggle)");
     } else {
-        show_dock("Win alone (toggle)", SHOW_MS);
+        show_dock(if moved { "Win alone (pointer display)" } else { "Win alone (toggle)" }, SHOW_MS);
     }
+}
+
+/// Win key tapped twice (`WM_DOCK_START_MENU`): opens (or closes) the dock's own Start menu
+/// (`popup_startmenu`: all apps, search, pins) on the bar, which in "pointer" mode is first brought
+/// to the display under the pointer. The first tap already toggled the bar, so it is shown again if
+/// that tap hid it.
+pub fn open_start_menu() {
+    follow_pointer();
+    if !VISIBLE.load(Relaxed) {
+        show_dock("Win double tap (Start menu)", SHOW_MS);
+    }
+    match anchor_for(ItemId::Start).or_else(bar_start_anchor) {
+        Some(a) => popup::toggle(PopupKind::StartMenu, a),
+        None => log!("open_start_menu: the bar has no geometry yet"),
+    }
+}
+
+/// Anchor at the left end of the bar, for the Start popup when the Start button is hidden.
+fn bar_start_anchor() -> Option<Anchor> {
+    let g = GEOM.with(|g| g.get())?;
+    let dpi = UI.with(|u| {
+        let st = u.borrow();
+        if st.monitor_dpi >= 96 {
+            st.monitor_dpi
+        } else {
+            st.metrics.dpi
+        }
+    });
+    Some(Anchor {
+        item: RECT { left: g.x, top: g.y, right: g.x + g.h, bottom: g.y + g.h },
+        bar: RECT { left: g.x, top: g.y, right: g.x + g.w, bottom: g.y + g.h },
+        top: config_top(),
+        dpi,
+    })
+}
+
+/// true when the bar follows the pointer (`config.monitor == "pointer"`).
+fn follows_pointer() -> bool {
+    config::get().monitor.eq_ignore_ascii_case(config::MONITOR_POINTER)
+}
+
+/// Display under the mouse pointer (the nearest one if the pointer position cannot be read).
+fn pointer_hmonitor() -> HMONITOR {
+    let p = cursor_pos().unwrap_or_default();
+    // SAFETY: MonitorFromPoint with MONITOR_DEFAULTTONEAREST has no preconditions and always returns a monitor.
+    unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) }
+}
+
+/// "pointer" mode: brings the bar to the display under the pointer (metrics, fonts, icons and
+/// geometry follow that display's DPI). Returns true if the bar changed display.
+fn follow_pointer() -> bool {
+    if !follows_pointer() {
+        return false;
+    }
+    let h = pointer_hmonitor();
+    let prev = FOLLOW_HMON.with(|c| c.replace(h.0 as isize));
+    if prev == h.0 as isize || GEOM.with(|g| g.get()).is_none() {
+        return false;
+    }
+    // A popup or the picker anchored to the old position would be left behind.
+    popup::close("bar moved to the pointer display");
+    picker_cancel("bar moved to the pointer display");
+    apply_dpi(dock_dpi());
+    true
 }
 
 /// The config changed on disk (`config::poll_changed` returned true): rebuilds the items
@@ -579,8 +667,10 @@ pub fn on_config_changed() {
         let st = u.borrow();
         (st.monitor_dpi, st.sizes)
     });
-    if mon >= 96 && BarSizes::from_config(&config::get()) != cur {
-        apply_dpi(mon);
+    // A different display (`monitor`) may also have a different DPI.
+    let dpi = dock_dpi();
+    if mon >= 96 && (dpi != mon || BarSizes::from_config(&config::get()) != cur) {
+        apply_dpi(dpi);
     }
     // Volume / notification modules switched: create or release their threads and COM objects.
     modules_sync();
@@ -600,6 +690,12 @@ pub fn on_config_changed() {
         if let Some(g) = GEOM.with(|g| g.get()) {
             show_topmost(hwnd(), &g);
         }
+    }
+    // Window previews switched off: no hover timer, picker hidden.
+    if !config::get().window_previews {
+        picker_cancel("window previews off");
+        // Off = no timer and no window: destroy it (idempotent; `open` recreates it).
+        crate::picker::shutdown();
     }
     // The bar may have moved or resized under an open popup (Settings): keep it attached to its item.
     if let Some(a) = popup::current().and_then(item_for_popup).and_then(anchor_for) {
@@ -708,7 +804,7 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Power | PopupKind::Settings => Some(ItemId::Power),
         PopupKind::TrayOverflow => Some(ItemId::TrayOverflow),
         PopupKind::Network => Some(ItemId::Network),
-        PopupKind::Start => Some(ItemId::Start),
+        PopupKind::Start | PopupKind::StartMenu => Some(ItemId::Start),
         PopupKind::AppMenu => None,
     }
 }
@@ -807,7 +903,7 @@ pub fn redraw() {
         let st = u.borrow();
         (st.metrics.dpi, st.sizes)
     });
-    let mi = match primary_monitor() {
+    let mi = match dock_monitor() {
         Ok(mi) => mi,
         Err(e) => {
             log!("redraw: {e}");
@@ -1240,6 +1336,11 @@ fn rebuild_entries() {
             set_timer(hwnd(), TIMER_ANIM, ANIM_TICK_MS);
         }
     });
+    // An open window picker whose app gained or lost windows closes (no live re-layout).
+    if let Some(k) = crate::picker::open_key() {
+        let wins = UI.with(|u| u.borrow().entries.iter().find(|e| e.group_key == k).map(|e| e.windows.clone()));
+        crate::picker::sync_windows(&k, wins.as_deref());
+    }
     request_missing();
 }
 
@@ -1275,9 +1376,19 @@ fn request_missing() {
 
 /// Applies a result from the shell thread; true if something changed.
 fn apply_shell_event(ev: ShellEvent) -> bool {
-    if let ShellEvent::Network(info) = ev {
-        return apply_network(info);
-    }
+    // Network and Start menu data go to the popups OUTSIDE the `UI` borrow (they may relayout).
+    let ev = match ev {
+        ShellEvent::Network(info) => return apply_network(info),
+        ShellEvent::StartApps(list) => {
+            popup::on_start_apps(list);
+            return false;
+        }
+        ShellEvent::StartIcons { icon_px, icons } => {
+            popup::on_start_icons(icon_px, icons);
+            return false;
+        }
+        other => other,
+    };
     UI.with(|u| {
         let st = &mut *u.borrow_mut();
         let px = st.sizes.icon_px(st.metrics) as u32;
@@ -1308,8 +1419,8 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
                 crate::popup::on_audio_outputs(list);
                 false
             }
-            // Handled by `apply_network` before the borrow.
-            ShellEvent::Network(_) => false,
+            // Handled before the borrow.
+            ShellEvent::Network(_) | ShellEvent::StartApps(_) | ShellEvent::StartIcons { .. } => false,
         }
     })
 }
@@ -1506,12 +1617,76 @@ fn set_hover(hit: Option<ItemId>) {
         retarget_plate(&mut st.plate, t, now_ms());
         true
     });
+    if changed {
+        picker_hover(hit);
+    }
     // Entering a tray icon: a single hover notification to the app.
     if let (true, Some(ItemId::Tray(id))) = (changed, hit) {
         if let Some(p) = cursor_pos() {
             tray_host::hover(id, p);
         }
     }
+}
+
+// ------------------------------------------------------------------ window picker
+
+/// App item `hit` with 2+ windows -> (index, group key, name); `None` otherwise.
+fn multi_window_app(hit: Option<ItemId>) -> Option<(usize, String, String)> {
+    let Some(ItemId::App(i)) = hit else { return None };
+    UI.with(|u| {
+        let st = u.borrow();
+        st.entries.get(i).filter(|e| e.windows.len() >= 2).map(|e| (i, e.group_key.clone(), e.name.clone()))
+    })
+}
+
+/// The hover changed to `hit`. On an app with 2+ windows (previews on) the picker's open delay is
+/// (re)armed; back on the item of the open picker it stays open; on another item the picker closes
+/// at once; off the bar it closes by itself unless the pointer reaches it (`picker::arm_leave`).
+/// Anything else kills the delay: no timer runs unless the pointer rests on such an item.
+fn picker_hover(hit: Option<ItemId>) {
+    let target = if config::get().window_previews { multi_window_app(hit) } else { None };
+    let open = crate::picker::open_key();
+    if let (Some((_, k, _)), Some(o)) = (&target, &open) {
+        if k == o {
+            kill_timer(hwnd(), TIMER_HOVER_PICKER);
+            crate::picker::cancel_leave();
+            return;
+        }
+    }
+    if open.is_some() {
+        if hit.is_none() {
+            crate::picker::arm_leave();
+        } else {
+            crate::picker::close("hover moved to another item");
+        }
+    }
+    if target.is_some() && !popup::is_open() {
+        set_timer(hwnd(), TIMER_HOVER_PICKER, PICKER_HOVER_MS);
+    } else {
+        kill_timer(hwnd(), TIMER_HOVER_PICKER);
+    }
+}
+
+/// `TIMER_HOVER_PICKER` (one-shot): the pointer rested on an app with 2+ windows: open its picker.
+fn on_hover_picker_timer(h: HWND) {
+    kill_timer(h, TIMER_HOVER_PICKER);
+    let (hover, busy) = UI.with(|u| {
+        let st = u.borrow();
+        (st.hover, st.pressed.is_some() || st.drag.is_some())
+    });
+    if busy || !VISIBLE.load(Relaxed) || popup::is_open() || !config::get().window_previews {
+        return;
+    }
+    let Some((i, key, name)) = multi_window_app(hover) else { return };
+    let Some(a) = anchor_for(ItemId::App(i)) else { return };
+    let name = if name.is_empty() { "Window".to_string() } else { name };
+    crate::picker::open(a, &key, &name, &apps::windows_in_order(&key));
+}
+
+/// Kills the picker's open delay and closes the picker (click on the bar, dock hidden, previews off).
+fn picker_cancel(reason: &str) {
+    kill_timer(hwnd(), TIMER_HOVER_PICKER);
+    crate::picker::close(reason);
 }
 
 fn on_mouse_move(h: HWND, wp: WPARAM, lp: LPARAM) {
@@ -1583,6 +1758,7 @@ fn on_lbutton_down(h: HWND, lp: LPARAM) {
     // A drop still settling is committed right away.
     finish_drag(now_ms(), true);
     let hit = hit_at(lo_i16(lp), hi_i16(lp));
+    picker_cancel("click on the bar");
     // An open popup closes right away on a click on the bar outside its own item (the bar is
     // NOACTIVATE: the popup does not receive WA_INACTIVE). On its own item `toggle` handles it on release.
     if popup::is_open() {
@@ -1634,6 +1810,7 @@ fn on_lbutton_up(lp: LPARAM) {
 }
 
 fn on_mbutton_up(lp: LPARAM) {
+    picker_cancel("middle click on the bar");
     match hit_at(lo_i16(lp), hi_i16(lp)) {
         Some(ItemId::App(i)) => {
             if let Some(e) = entry_at(i) {
@@ -1650,6 +1827,7 @@ fn on_mbutton_up(lp: LPARAM) {
 }
 
 fn on_rbutton_up(lp: LPARAM) {
+    picker_cancel("right click on the bar");
     match hit_at(lo_i16(lp), hi_i16(lp)) {
         Some(ItemId::App(i)) => {
             if let Some(e) = entry_at(i) {
@@ -2184,9 +2362,14 @@ fn click_left(id: ItemId) {
             popup::close("show desktop");
             shell_thread::request(ShellRequest::ToggleDesktop);
         }
+        // Left click opens the dock's own Start menu (`popup_startmenu`), like the Win double tap;
+        // without a popup (class not registered) it falls back to the Windows Start menu.
         ItemId::Start => {
-            popup::close("start");
-            shell_thread::request(ShellRequest::OpenStart);
+            if popup::is_available() {
+                toggle_popup(PopupKind::StartMenu, id);
+            } else {
+                shell_thread::request(ShellRequest::OpenStart);
+            }
         }
         ItemId::Network => {
             if popup::is_available() {
@@ -2206,6 +2389,43 @@ fn click_left(id: ItemId) {
 /// `pub` because the notifications popup also uses it ("Open notification center").
 pub fn send_win_n() {
     send_win_key(VK_N);
+}
+
+/// Click on a notification card (`popup_notif`). Windows offers no way to activate another app's
+/// toast, so the app that sent it is brought up instead: its most recent window if it has one (the
+/// group with the same AUMID, or a bar item / exe with the same name), otherwise the shell thread
+/// launches it from the AppsFolder catalog (`ShellRequest::OpenNotifApp`, Win+N as the last resort).
+pub fn open_notification_app(aumid: &str, app: &str) {
+    let groups = apps::groups();
+    let alive = |g: &&apps::AppGroup| !g.windows.is_empty();
+    let by_aumid = (!aumid.is_empty())
+        .then(|| {
+            groups.iter().filter(alive).find(|g| g.aumid.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(aumid)))
+        })
+        .flatten();
+    let by_name = || {
+        if app.is_empty() {
+            return None;
+        }
+        let key = UI.with(|u| {
+            u.borrow()
+                .entries
+                .iter()
+                .find(|e| !e.windows.is_empty() && e.name.eq_ignore_ascii_case(app))
+                .map(|e| e.group_key.clone())
+        });
+        key.and_then(|k| groups.iter().filter(alive).find(|g| g.key == k)).or_else(|| {
+            groups.iter().filter(alive).find(|g| {
+                Path::new(&g.exe_path).file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(app))
+            })
+        })
+    };
+    if let Some(g) = by_aumid.or_else(by_name) {
+        log!("notification: activating '{}' ({} windows)", g.key, g.windows.len());
+        apps::activate_window(g.windows[0]);
+        return;
+    }
+    shell_thread::request(ShellRequest::OpenNotifApp { aumid: aumid.to_string(), name: app.to_string() });
 }
 
 /// Win + `vk` pressed and released with `dwExtraInfo = INJECT_TAG` (Win+N, Win+S, Win+R ...).
@@ -2298,10 +2518,116 @@ fn config_top() -> bool {
     config::effective_position() == config::Position::Top
 }
 
-/// Effective DPI of the primary monitor (96 if the call fails).
-fn primary_dpi() -> u32 {
+/// A display the bar can sit on (Settings -> Screen, `config.monitor`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Screen {
+    /// GDI device name, e.g. "\\.\DISPLAY2" (the value stored in `config.monitor`).
+    pub device: String,
+    /// Short label: the display number Windows puts in the device name ("2"), or its position.
+    pub label: &'static str,
+    pub primary: bool,
+}
+
+/// Displays offered by the Settings popup (more are ignored: the segments would not fit).
+const MAX_SCREENS: usize = 6;
+const SCREEN_LABELS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+/// Every connected display with its `MONITORINFOEXW`, in enumeration order.
+fn enum_monitors() -> Vec<(HMONITOR, MONITORINFOEXW)> {
+    unsafe extern "system" fn add(h: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
+        // SAFETY: `lp` is the `&mut Vec` passed below, alive for the whole (synchronous) enumeration.
+        let out = unsafe { &mut *(lp.0 as *mut Vec<(HMONITOR, MONITORINFOEXW)>) };
+        let mut mi = MONITORINFOEXW::default();
+        mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: `mi` is a writable MONITORINFOEXW whose cbSize says so.
+        if unsafe { GetMonitorInfoW(h, &mut mi.monitorInfo) }.as_bool() {
+            out.push((h, mi));
+        }
+        BOOL(1)
+    }
+    let mut out: Vec<(HMONITOR, MONITORINFOEXW)> = Vec::new();
+    // SAFETY: the callback only touches `out` through `lp`, and only during this call.
+    let _ = unsafe { EnumDisplayMonitors(None, None, Some(add), LPARAM(&mut out as *mut _ as isize)) };
+    out
+}
+
+fn device_name(mi: &MONITORINFOEXW) -> String {
+    let n = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(mi.szDevice.len());
+    String::from_utf16_lossy(&mi.szDevice[..n])
+}
+
+/// Label of the display named `device` ("\\.\DISPLAY2" -> "2"); `idx` (0-based) if it has no number.
+fn screen_label(device: &str, idx: usize) -> &'static str {
+    let digits: String =
+        device.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+    let n = digits.parse::<usize>().ok().filter(|n| (1..=SCREEN_LABELS.len()).contains(n)).unwrap_or(idx + 1);
+    SCREEN_LABELS[(n - 1).min(SCREEN_LABELS.len() - 1)]
+}
+
+/// Connected displays: the primary first, then the others by device name. At most `MAX_SCREENS`.
+pub fn screens() -> Vec<Screen> {
+    let mut v: Vec<(bool, String)> = enum_monitors()
+        .iter()
+        .map(|(_, mi)| (mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0, device_name(mi)))
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    v.truncate(MAX_SCREENS);
+    v.into_iter()
+        .enumerate()
+        .map(|(i, (primary, device))| Screen { label: screen_label(&device, i), device, primary })
+        .collect()
+}
+
+/// The display the bar belongs on: `config.monitor` if it is connected, otherwise the primary one.
+fn dock_hmonitor() -> HMONITOR {
+    let want = config::get().monitor.clone();
+    if want.eq_ignore_ascii_case(config::MONITOR_POINTER) {
+        return followed_hmonitor();
+    }
+    let found = if want.is_empty() {
+        None
+    } else {
+        enum_monitors().into_iter().find(|(_, mi)| device_name(mi).eq_ignore_ascii_case(&want)).map(|(h, _)| h)
+    };
     // SAFETY: MonitorFromPoint with MONITOR_DEFAULTTOPRIMARY always returns a monitor.
-    let mon = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    let h = found.unwrap_or_else(|| unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) });
+    // Logged only when the display actually changes (chosen, unplugged, plugged back).
+    let prev = LAST_HMON.with(|c| c.replace(h.0 as isize));
+    if prev != h.0 as isize {
+        if found.is_none() && !want.is_empty() {
+            log!("monitor: \"{want}\" not connected, the bar uses the primary monitor");
+        } else {
+            log!("monitor: the bar uses {}", if want.is_empty() { "the primary monitor" } else { want.as_str() });
+        }
+    }
+    h
+}
+
+/// "pointer" mode: the display the Win key last brought the bar to, as long as it is connected;
+/// otherwise (first use, display unplugged) the display under the pointer, which becomes the new one.
+fn followed_hmonitor() -> HMONITOR {
+    let cur = FOLLOW_HMON.with(|c| c.get());
+    let mons = enum_monitors();
+    let h = match mons.iter().find(|(m, _)| cur != 0 && m.0 as isize == cur) {
+        Some((m, _)) => *m,
+        None => {
+            let m = pointer_hmonitor();
+            FOLLOW_HMON.with(|c| c.set(m.0 as isize));
+            m
+        }
+    };
+    // Logged only when the display actually changes.
+    let prev = LAST_HMON.with(|c| c.replace(h.0 as isize));
+    if prev != h.0 as isize {
+        let name = mons.iter().find(|(m, _)| *m == h).map(|(_, mi)| device_name(mi)).unwrap_or_default();
+        log!("monitor: the bar follows the pointer, now on {name}");
+    }
+    h
+}
+
+/// Effective DPI of the bar's display (96 if the call fails).
+fn dock_dpi() -> u32 {
+    let mon = dock_hmonitor();
     let (mut dx, mut dy) = (96u32, 96u32);
     // SAFETY: `dx`/`dy` are valid, writable u32s for the duration of the call.
     match unsafe { GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) } {
@@ -2310,9 +2636,8 @@ fn primary_dpi() -> u32 {
     }
 }
 
-fn primary_monitor() -> Result<MONITORINFO, String> {
-    // SAFETY: MonitorFromPoint with MONITOR_DEFAULTTOPRIMARY always returns a monitor.
-    let mon = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+fn dock_monitor() -> Result<MONITORINFO, String> {
+    let mon = dock_hmonitor();
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: `mi` has cbSize initialized and is writable.
     if !unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
@@ -2321,10 +2646,10 @@ fn primary_monitor() -> Result<MONITORINFO, String> {
     Ok(mi)
 }
 
-/// Geometry: bar of `bar_w` physical px, horizontally centered on the primary monitor's
-/// work area, `render::bar_height` tall, `EDGE_MARGIN` logical from the edge (bottom or top).
+/// Geometry: bar of `bar_w` physical px, horizontally centered on the work area of the bar's
+/// display, `render::bar_height` tall, `EDGE_MARGIN` logical from the edge (bottom or top).
 fn compute_geom(top: bool, bar_w: i32, dpi: u32, sizes: BarSizes) -> Result<Geom, String> {
-    geom_from(&primary_monitor()?, top, bar_w, dpi, sizes)
+    geom_from(&dock_monitor()?, top, bar_w, dpi, sizes)
 }
 
 fn geom_from(mi: &MONITORINFO, top: bool, bar_w: i32, dpi: u32, sizes: BarSizes) -> Result<Geom, String> {
@@ -2446,6 +2771,7 @@ pub fn hide_dock(reason: &str) {
     let instant = FS_SHOWN.swap(false, Relaxed);
     let prev = if instant { FS_PREV.swap(0, Relaxed) } else { 0 };
     crate::popup::close("dock hidden");
+    picker_cancel("dock hidden");
     if instant {
         stop_vis_anim(0.0);
         hide_window(hwnd());
@@ -2793,6 +3119,7 @@ fn on_poll() {
         }
         if point_in(&bar, p)
             || crate::popup::is_open()
+            || crate::picker::is_open()
             || !autohide
             || tray_host::foreign_menu_active()
             || drag_active()
@@ -2810,7 +3137,7 @@ fn on_poll() {
             reassert_topmost(hwnd());
         }
     }
-    // Screen edge: y==top (bar at the top) or y==bottom-1 (bar at the bottom), on the primary monitor.
+    // Screen edge: y==top (bar at the top) or y==bottom-1 (bar at the bottom), on the bar's display.
     let edge_y = if config_top() { g.mon.top } else { g.mon.bottom - 1 };
     let at_edge = p.y == edge_y && p.x >= g.mon.left && p.x < g.mon.right && edge_is_screen_border(&g, p.x);
     if !at_edge {

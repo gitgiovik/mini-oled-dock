@@ -21,6 +21,10 @@
 //! Drop). Instead `SetCompleted(AsyncOperationCompletedHandler)` sends on an mpsc channel and
 //! we use `recv_timeout` (5 s; 15 s for `RequestAccessAsync`). Timeout = log + access `Unavailable`.
 //!
+//! REMOVAL: `RemoveNotification` / `ClearNotifications` need package identity and fail for the dock
+//! (0x80070490); the fallback is the per-app notification history (`history_remove`,
+//! `history_clear_apps`), which does answer for an unpackaged exe.
+//!
 //! UI -> thread commands (`remove`, `clear_all`, `toggle_dnd`, `refresh_now`, `set_popup_open`):
 //! mpsc channel; `recv_timeout` on the channel doubles as the polling wait, so a command wakes
 //! the thread immediately. Never blocking for the caller.
@@ -105,6 +109,9 @@ pub struct NotifItem {
     pub time_text: String,
     /// App icon key for `notif::app_icon` (AUMID, or "name:<app>"); "" = none.
     pub icon_key: String,
+    /// AppUserModelID of the app that sent it ("" if unknown): used to open the app on a click and
+    /// to remove the toast through the per-app notification history.
+    pub aumid: String,
 }
 
 /// State of access to the notification list.
@@ -229,12 +236,12 @@ pub fn set_popup_open(open: bool) {
     send_cmd(Cmd::PopupOpen(open));
 }
 
-/// Removes a notification (`RemoveNotification(id)`), then re-reads.
+/// Removes a notification (`RemoveNotification(id)`, else through the app history), then re-reads.
 pub fn remove(id: u32) {
     send_cmd(Cmd::Remove(id));
 }
 
-/// "Clear all" (`ClearNotifications()`), then re-reads.
+/// "Clear all" (`ClearNotifications()`, else app by app through the history), then re-reads.
 pub fn clear_all() {
     send_cmd(Cmd::ClearAll);
 }
@@ -429,7 +436,14 @@ impl Worker {
                 self.force_full = true;
                 if let Some(l) = self.listener.as_ref() {
                     if let Err(e) = l.RemoveNotification(id) {
-                        log!("notif: RemoveNotification({id}) failed: {e}");
+                        // Expected for an exe without package identity (0x80070490): the toast is
+                        // removed through its app's notification history instead.
+                        let item = self.last.items.iter().find(|it| it.id == id);
+                        match item.map(history_remove) {
+                            Some(Ok(())) => log!("notif: toast {id} removed through the app history"),
+                            Some(Err(e2)) => log!("notif: RemoveNotification({id}) failed: {e}; history: {e2}"),
+                            None => log!("notif: RemoveNotification({id}) failed: {e}"),
+                        }
                     }
                 }
             }
@@ -437,7 +451,9 @@ impl Worker {
                 self.force_full = true;
                 if let Some(l) = self.listener.as_ref() {
                     if let Err(e) = l.ClearNotifications() {
-                        log!("notif: ClearNotifications failed: {e}");
+                        // Same as above: clear the history of every app that has toasts listed.
+                        log!("notif: ClearNotifications failed: {e}, clearing app by app");
+                        history_clear_apps(&self.last.items);
                     }
                 }
             }
@@ -594,7 +610,82 @@ fn convert_item(u: &UserNotification, id: u32, time_ft: u64, binding_name: &HSTR
         String::new()
     };
     ensure_icon(&icon_key, &aumid, info);
-    Ok(NotifItem { id, app: truncate(&app), title, body, time_ft, time_text: String::new(), icon_key })
+    Ok(NotifItem { id, app: truncate(&app), title, body, time_ft, time_text: String::new(), icon_key, aumid })
+}
+
+// ------------------------------------------------------------------ removal through the app history
+//
+// `UserNotificationListener::RemoveNotification` / `ClearNotifications` need package identity and
+// fail for the dock (0x80070490, like `NotificationChanged`). The per-app notification history
+// (`ToastNotificationManager::History`, the overloads that take an AppUserModelID) does answer for
+// an unpackaged exe, so it is used as the fallback.
+
+/// Clears the notification history of every distinct app in `items`.
+fn history_clear_apps(items: &[NotifItem]) {
+    let history = match ToastNotificationManager::History() {
+        Ok(h) => h,
+        Err(e) => {
+            log!("notif: ToastNotificationManager::History failed: {e}");
+            return;
+        }
+    };
+    let mut done: Vec<&str> = Vec::new();
+    for it in items {
+        let a = it.aumid.as_str();
+        if a.is_empty() || done.iter().any(|d| d.eq_ignore_ascii_case(a)) {
+            continue;
+        }
+        done.push(a);
+        match history.ClearWithId(&HSTRING::from(a)) {
+            Ok(()) => log!("notif: history of '{a}' cleared"),
+            Err(e) => log!("notif: ClearWithId('{a}') failed: {e}"),
+        }
+    }
+    let unknown = items.iter().filter(|it| it.aumid.is_empty()).count();
+    if unknown > 0 {
+        log!("notif: {unknown} toasts without an app id could not be cleared");
+    }
+}
+
+/// Text elements of a toast in the history, from its XML content.
+fn toast_texts(t: &windows::UI::Notifications::ToastNotification) -> Vec<String> {
+    let Ok(nodes) = t.Content().and_then(|x| x.GetElementsByTagName(&HSTRING::from("text"))) else {
+        return Vec::new();
+    };
+    let n = nodes.Length().unwrap_or(0);
+    (0..n).filter_map(|i| nodes.Item(i).and_then(|node| node.InnerText()).ok()).map(|s| s.to_string()).collect()
+}
+
+/// Removes the history toast of `it.aumid` whose texts match `it` (same title and body as built by
+/// `convert_item`). A toast without a tag cannot be addressed alone: it is removed by clearing the
+/// app's history only when it is the app's last toast.
+fn history_remove(it: &NotifItem) -> Result<(), String> {
+    if it.aumid.is_empty() {
+        return Err("no app id".into());
+    }
+    let h = ToastNotificationManager::History().map_err(|e| format!("History: {e}"))?;
+    let aid = HSTRING::from(it.aumid.as_str());
+    let list = h.GetHistoryWithId(&aid).map_err(|e| format!("GetHistoryWithId: {e}"))?;
+    let n = list.Size().map_err(|e| format!("Size: {e}"))?;
+    for i in 0..n {
+        let Ok(t) = list.GetAt(i) else { continue };
+        let texts = toast_texts(&t);
+        let title = texts.first().map(|s| truncate(s)).unwrap_or_default();
+        let body = if texts.len() > 1 { truncate(&texts[1..].join(" ")) } else { String::new() };
+        if title != it.title || body != it.body {
+            continue;
+        }
+        let tag = t.Tag().map_err(|e| format!("Tag: {e}"))?;
+        if tag.is_empty() {
+            if n == 1 {
+                return h.ClearWithId(&aid).map_err(|e| format!("ClearWithId: {e}"));
+            }
+            return Err("toast without a tag".into());
+        }
+        let group = t.Group().map_err(|e| format!("Group: {e}"))?;
+        return h.RemoveGroupedTagWithId(&tag, &group, &aid).map_err(|e| format!("RemoveGroupedTagWithId: {e}"));
+    }
+    Err("toast not found in the app history".into())
 }
 
 // ------------------------------------------------------------------ times
