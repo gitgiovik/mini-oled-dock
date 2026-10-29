@@ -837,7 +837,7 @@ fn load_app_icon(req: &IconReq) -> Option<IconBitmap> {
     match logo_bytes(info) {
         Ok(bytes) => icons::decode_image_bytes(&bytes).map(|b| icons::resize_area(&b, ICON_PX)),
         Err(e) => {
-            log!("notif-icons: GetLogo failed: {e}");
+            log!("notif-icons: no app icon: {e}");
             None
         }
     }
@@ -848,7 +848,14 @@ fn logo_bytes(info: &AppInfo) -> Result<Vec<u8>, String> {
     let reference = info
         .DisplayInfo()
         .and_then(|d| d.GetLogo(Size { Width: 64.0, Height: 64.0 }))
-        .map_err(|e| format!("GetLogo: {e}"))?;
+        .map_err(|e| {
+            // windows-rs reports a null WinRT result as an error carrying S_OK: the app has no logo.
+            if e.code().is_ok() {
+                "app exposes no logo".to_string()
+            } else {
+                format!("GetLogo: {e}")
+            }
+        })?;
     let op = reference.OpenReadAsync().map_err(|e| format!("OpenReadAsync: {e}"))?;
     let stream = await_op(&op, ASYNC_TIMEOUT)?;
     let size = stream.Size().map_err(|e| format!("Size: {e}"))?;

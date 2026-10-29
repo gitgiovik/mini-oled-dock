@@ -1909,9 +1909,16 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
     // AppBar window (when given) and does not run above medium, otherwise a medium sender could
     // make us write into a section of an elevated process.
     if matches!(m.message, ABM_GETTASKBARPOS | ABM_QUERYPOS | ABM_SETPOS) {
-        let wnd_ok = wp.0 == 0 || window_pid(HWND(wp.0 as *mut c_void)) == m.pid;
-        if !wnd_ok || !pid_at_most_medium(m.pid) {
-            log!("tray: AppBar {} rejected (pid {} not verified)", m.message, m.pid);
+        let wnd_pid = if wp.0 == 0 { None } else { Some(window_pid(HWND(wp.0 as *mut c_void))) };
+        // SAFETY: no preconditions.
+        let own = unsafe { GetCurrentProcessId() };
+        if !appbar_block_allowed(m.pid, own, wnd_pid, pid_at_most_medium) {
+            log!(
+                "tray: AppBar {} rejected (block pid {}, window pid {} not verified)",
+                m.message,
+                m.pid,
+                wnd_pid.map_or_else(|| "-".to_string(), |p| p.to_string())
+            );
             return LRESULT(0);
         }
     }
@@ -1919,6 +1926,20 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         ABM_GETTASKBARPOS => get_taskbar_pos(&m),
         ABM_QUERYPOS | ABM_SETPOS => forward_with_shared(wp, m),
         _ => forward_sync(wp, lp),
+    }
+}
+
+/// Whether an AppBar shared block may be locked/written. `block_pid` is the process holding the
+/// handle (`m.pid`), `own` this process, `wnd_pid` the owner of the AppBar window (`None` = no window).
+/// shell32 allocates the block directly for the tray window's process, so for a real AppBar
+/// `block_pid == own` and the window belongs to the app: in that case the app (window owner) is what
+/// must not run above medium. A block living in another process keeps the original rule (it must be
+/// the window owner's and at most medium). Pure: `medium` is injected for tests.
+fn appbar_block_allowed(block_pid: u32, own: u32, wnd_pid: Option<u32>, medium: impl Fn(u32) -> bool) -> bool {
+    match wnd_pid {
+        None => medium(block_pid),
+        Some(w) if block_pid == own => w != 0 && w != own && medium(w),
+        Some(w) => w == block_pid && medium(block_pid),
     }
 }
 
@@ -2214,6 +2235,25 @@ mod tests {
         assert_eq!(items[0].owner, 0x20);
         assert_eq!(items[0].pid, 6);
         assert_eq!(guid_string(&items[0].guid.unwrap_or(GUID::zeroed())), "7820ae73-23e3-4229-82c1-e41cb67d5b9c");
+    }
+
+    #[test]
+    fn appbar_block_gating() {
+        const OWN: u32 = 100;
+        let medium = |p: u32| p != 0 && p != 666; // 666 = elevated process
+        // Real case: block allocated for us, window of a medium app -> allowed (was rejected).
+        assert!(appbar_block_allowed(OWN, OWN, Some(8120), medium));
+        // Block for us but window of an elevated app, dead window, or our own window -> rejected.
+        assert!(!appbar_block_allowed(OWN, OWN, Some(666), medium));
+        assert!(!appbar_block_allowed(OWN, OWN, Some(0), medium));
+        assert!(!appbar_block_allowed(OWN, OWN, Some(OWN), |_| true));
+        // Block in another process: must be the window owner's and at most medium (unchanged).
+        assert!(appbar_block_allowed(8120, OWN, Some(8120), medium));
+        assert!(!appbar_block_allowed(666, OWN, Some(8120), medium));
+        assert!(!appbar_block_allowed(666, OWN, Some(666), medium));
+        // No window: only the block's process is checked (unchanged).
+        assert!(appbar_block_allowed(OWN, OWN, None, |p| p == OWN));
+        assert!(!appbar_block_allowed(666, OWN, None, medium));
     }
 
     #[test]

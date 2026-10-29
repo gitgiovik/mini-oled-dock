@@ -2420,7 +2420,11 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
         arm_clock(hwnd());
         sysmon_sync();
     }
-    log!("SHOW ({reason}), hiding in {hide_after_ms} ms");
+    if hide_after_ms >= u64::MAX / 4 {
+        log!("SHOW ({reason}), autohide off");
+    } else {
+        log!("SHOW ({reason}), hiding in {hide_after_ms} ms");
+    }
     if !was_visible {
         FS_SHOWN.store(fs.is_some(), Relaxed);
         FS_PREV.store(fs.map(|h| h.0 as isize).unwrap_or(0), Relaxed);
