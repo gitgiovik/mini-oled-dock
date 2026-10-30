@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **This repository has moved to [ops-software/mini-oled-dock](https://github.com/ops-software/mini-oled-dock).** This copy is archived and read-only: releases, issues and pull requests now live there.
+
 # mini-oled-dock
 
 A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust with raw Win32 and no UI framework.
