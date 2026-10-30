@@ -31,20 +31,16 @@
 //! (1) icon only, (2) icon only with reduced padding; if that is not enough, the last apps are
 //! left out of the layout (so they are neither visible nor clickable).
 //!
+//! The GDI backing (DCs, DIBs), the fonts helpers, the text compositing, the presentation and the
+//! pixel primitives (`Canvas`) are the ones of `surface.rs`, shared with the popups: this module
+//! owns the bar state (`Gfx`), the layout and what to paint where.
+//!
 //! THREADING: UI thread only (thread-local GDI state). DIBs are recreated by `resize`.
 
 use std::cell::RefCell;
-use std::ffi::c_void;
 
-use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
-use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject, DrawTextW, GdiFlush, GetDC,
-    GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, HBITMAP, HDC, HFONT,
-    HGDIOBJ, LOGFONTW, TEXTMETRICW, TRANSPARENT,
-};
-use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{HDC, HFONT};
 
 use crate::audio::VolumeState;
 use crate::config::DisplayMode;
@@ -53,6 +49,9 @@ use crate::icons::IconBitmap;
 use crate::log;
 use crate::metrics::Usage;
 use crate::net::{NetKind, NetStatus};
+use crate::surface::{
+    argb, create_font, delete_font, div255, line_height, over, rect_wh, rr_cov, white, Canvas, Gdi, TEXT_FACES, WHITE,
+};
 
 // ------------------------------------------------------------ logical measures
 
@@ -491,26 +490,12 @@ pub fn plate_rect(item: RECT, m: Metrics) -> RECT {
 
 // ------------------------------------------------------------ GDI state
 
-/// 32-bit top-down DIB selected into a DC.
-struct Dib {
-    bmp: HBITMAP,
-    /// Bitmap that was selected in the DC before ours (to restore before deleting the DIB).
-    old: HGDIOBJ,
-    bits: *mut u32,
-    w: i32,
-    h: i32,
-}
-
 struct Gfx {
     metrics: Metrics,
-    /// DC holding the main DIB (source of `UpdateLayeredWindow`).
-    dc_main: HDC,
-    /// DC holding the scratch DIB for text, with the font selected.
-    dc_txt: HDC,
+    /// Memory DCs, main DIB (source of `UpdateLayeredWindow`) and text scratch DIB.
+    gdi: Gdi,
     sizes: BarSizes,
     fonts: Fonts,
-    main: Option<Dib>,
-    txt: Option<Dib>,
     /// Width (physical px) of the pill during the width animation; 0 = full.
     pill_w: i32,
 }
@@ -545,8 +530,7 @@ impl Fonts {
 
     fn delete(&self) {
         for f in [self.app, self.module, self.small] {
-            // SAFETY: fonts created by `build_fonts`; they are only selected temporarily, never at deletion.
-            let _ = unsafe { DeleteObject(HGDIOBJ(f.0)) };
+            delete_font(f);
         }
     }
 }
@@ -562,165 +546,17 @@ enum Txt {
     Small,
 }
 
-/// Pixels of a DIB as a slice.
-/// Invariant: the bitmap (w*h*4 bytes) is alive as long as the `Dib` exists; the slice must be used in short
-/// scopes and must not coexist with GDI calls that write to the same DIB (here GDI only writes
-/// to the text scratch DIB, never to the main one).
-fn dib_pixels<'a>(d: &Dib) -> &'a mut [u32] {
-    // SAFETY: see invariant above; `bits` points to w*h u32 allocated by CreateDIBSection.
-    unsafe { std::slice::from_raw_parts_mut(d.bits, (d.w as usize) * (d.h as usize)) }
-}
-
-fn make_dib(dc: HDC, w: i32, h: i32) -> Result<Dib, String> {
-    if w <= 0 || h <= 0 {
-        return Err(format!("invalid DIB dimensions {w}x{h}"));
-    }
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            biHeight: -h, // top-down
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits: *mut c_void = std::ptr::null_mut();
-    // SAFETY: `bmi` is valid; `bits` receives the pointer to the buffer owned by the bitmap.
-    let bmp = unsafe { CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) }
-        .map_err(|e| format!("CreateDIBSection {w}x{h}: {e}"))?;
-    if bits.is_null() {
-        // SAFETY: `bmp` was just created and is not selected anywhere.
-        let _ = unsafe { DeleteObject(HGDIOBJ(bmp.0)) };
-        return Err("CreateDIBSection: null bits".into());
-    }
-    // SAFETY: `dc` and `bmp` are valid; the previous bitmap is saved for restoring.
-    let old = unsafe { SelectObject(dc, HGDIOBJ(bmp.0)) };
-    Ok(Dib { bmp, old, bits: bits.cast::<u32>(), w, h })
-}
-
-fn free_dib(dc: HDC, d: Dib) {
-    // SAFETY: `d` was created by `make_dib` with this same `dc`; the original bitmap is restored
-    // before deleting ours (a selected bitmap cannot be deleted).
-    unsafe {
-        SelectObject(dc, d.old);
-        let _ = DeleteObject(HGDIOBJ(d.bmp.0));
-    }
-}
-
-fn make_font(face: &str, height_px: i32) -> HFONT {
-    let mut lf = LOGFONTW {
-        lfHeight: -height_px,
-        lfWeight: 400,
-        lfCharSet: DEFAULT_CHARSET,
-        lfQuality: ANTIALIASED_QUALITY, // grayscale, no ClearType
-        ..Default::default()
-    };
-    for (d, s) in lf.lfFaceName.iter_mut().zip(face.encode_utf16().take(31)) {
-        *d = s;
-    }
-    // SAFETY: `lf` is fully initialized.
-    unsafe { CreateFontIndirectW(&lf) }
-}
-
-/// Creates the `height_px` font trying "Segoe UI Variable Text" and then "Segoe UI". GDI silently
-/// substitutes a missing font, so the actual name is checked with `GetTextFaceW`.
-fn create_font(dc: HDC, height_px: i32) -> Result<HFONT, String> {
-    for face in ["Segoe UI Variable Text", "Segoe UI"] {
-        let f = make_font(face, height_px);
-        if f.is_invalid() {
-            continue;
-        }
-        let mut buf = [0u16; 64];
-        // SAFETY: `dc` is valid; the font is selected only for the check and then restored.
-        let got = unsafe {
-            let old = SelectObject(dc, HGDIOBJ(f.0));
-            let n = GetTextFaceW(dc, Some(&mut buf));
-            SelectObject(dc, old);
-            n
-        };
-        let name = String::from_utf16_lossy(&buf[..(got.max(0) as usize).min(buf.len())]);
-        if name.trim_end_matches('\0').eq_ignore_ascii_case(face) {
-            return Ok(f);
-        }
-        // SAFETY: `f` was created above and is not selected.
-        let _ = unsafe { DeleteObject(HGDIOBJ(f.0)) };
-    }
-    let f = make_font("Segoe UI", height_px);
-    if f.is_invalid() {
-        Err("CreateFontIndirectW failed".into())
-    } else {
-        Ok(f)
-    }
-}
-
-fn line_height(dc: HDC, font: HFONT) -> i32 {
-    let mut tm = TEXTMETRICW::default();
-    // SAFETY: `dc` is valid, `tm` is writable; the font is restored immediately.
-    let ok = unsafe {
-        let old = SelectObject(dc, HGDIOBJ(font.0));
-        let ok = GetTextMetricsW(dc, &mut tm);
-        SelectObject(dc, old);
-        ok
-    };
-    if ok.as_bool() && tm.tmHeight > 0 {
-        tm.tmHeight
-    } else {
-        font_fallback_height()
-    }
-}
-
-fn font_fallback_height() -> i32 {
-    17
-}
-
 // ------------------------------------------------------------------ API
 
 /// Creates the GDI resources (memory DCs, Segoe UI Variable Text fonts -> Segoe UI fallback, see
 /// `Fonts`) for the given `metrics` and `sizes`. The DIB is born with the first `resize`.
 pub fn init(metrics: Metrics, sizes: BarSizes) -> Result<(), String> {
     destroy();
-    // SAFETY: the screen DC is taken and released here; the memory DCs are ours.
-    let (dc_main, dc_txt) = unsafe {
-        let screen = GetDC(None);
-        let a = CreateCompatibleDC(Some(screen));
-        let b = CreateCompatibleDC(Some(screen));
-        ReleaseDC(None, screen);
-        (a, b)
-    };
-    if dc_main.is_invalid() || dc_txt.is_invalid() {
-        // SAFETY: any valid DCs created above, not yet used.
-        unsafe {
-            if !dc_main.is_invalid() {
-                let _ = DeleteDC(dc_main);
-            }
-            if !dc_txt.is_invalid() {
-                let _ = DeleteDC(dc_txt);
-            }
-        }
-        return Err("CreateCompatibleDC failed".into());
-    }
-    // SAFETY: `dc_txt` is valid. White text, transparent background: the coverage ends up in the G channel.
-    unsafe {
-        SetBkMode(dc_txt, TRANSPARENT);
-        SetTextColor(dc_txt, COLORREF(0x00FF_FFFF));
-    }
-    let fonts = match build_fonts(dc_txt, metrics, sizes) {
-        Ok(v) => v,
-        Err(e) => {
-            // SAFETY: DCs created above, with no selected objects.
-            unsafe {
-                let _ = DeleteDC(dc_main);
-                let _ = DeleteDC(dc_txt);
-            }
-            return Err(e);
-        }
-    };
+    let gdi = Gdi::new()?;
+    // On error `gdi` is dropped, which deletes the DCs.
+    let fonts = build_fonts(gdi.dc_txt(), metrics, sizes)?;
     GFX.with(|c| {
-        *c.borrow_mut() =
-            Some(Gfx { metrics, dc_main, dc_txt, sizes, fonts, main: None, txt: None, pill_w: 0 });
+        *c.borrow_mut() = Some(Gfx { metrics, gdi, sizes, fonts, pill_w: 0 });
     });
     log!("render::init: dpi={} {sizes:?}", metrics.dpi);
     Ok(())
@@ -730,12 +566,11 @@ fn build_fonts(dc: HDC, m: Metrics, s: BarSizes) -> Result<Fonts, String> {
     let mm = s.module_metrics(m);
     let mut made: Vec<HFONT> = Vec::with_capacity(3);
     for px in [m.px(s.text), mm.px(13), mm.px(11)] {
-        match create_font(dc, px.max(1)) {
+        match create_font(dc, &TEXT_FACES, px.max(1), 400) {
             Ok(f) => made.push(f),
             Err(e) => {
                 for f in made {
-                    // SAFETY: created above, never selected.
-                    let _ = unsafe { DeleteObject(HGDIOBJ(f.0)) };
+                    delete_font(f);
                 }
                 return Err(e);
             }
@@ -761,19 +596,14 @@ pub fn set_metrics(metrics: Metrics, sizes: BarSizes) -> Result<(), String> {
         if g.metrics == metrics && g.sizes == sizes {
             return Ok(());
         }
-        let fonts = build_fonts(g.dc_txt, metrics, sizes)?;
+        let fonts = build_fonts(g.gdi.dc_txt(), metrics, sizes)?;
         // The old fonts are not selected in the DCs (they are only selected temporarily).
         g.fonts.delete();
         g.fonts = fonts;
         g.metrics = metrics;
         g.sizes = sizes;
         // The DIBs depend on the DPI (height of the text DIB): they are recreated by the next `resize`.
-        if let Some(d) = g.main.take() {
-            free_dib(g.dc_main, d);
-        }
-        if let Some(d) = g.txt.take() {
-            free_dib(g.dc_txt, d);
-        }
+        g.gdi.free_dibs();
         log!("render::set_metrics: dpi={} {sizes:?}", metrics.dpi);
         Ok(())
     })
@@ -792,22 +622,9 @@ fn measure(s: &str, t: Txt, m: Metrics) -> i32 {
     measured.unwrap_or_else(|| s.chars().count() as i32 * m.px(if t == Txt::Small { 6 } else { 7 }))
 }
 
+/// Width in pixels of text `s` with font `t` (7 px per UTF-16 unit if GDI fails).
 fn text_width(g: &Gfx, s: &str, t: Txt) -> i32 {
-    let wide: Vec<u16> = s.encode_utf16().collect();
-    let font = g.fonts.get(t).0;
-    let mut sz = SIZE::default();
-    // SAFETY: `dc_txt` is valid; `wide` and `sz` outlive the call; the font is restored.
-    let ok = unsafe {
-        let old = SelectObject(g.dc_txt, HGDIOBJ(font.0));
-        let ok = GetTextExtentPoint32W(g.dc_txt, &wide, &mut sz);
-        SelectObject(g.dc_txt, old);
-        ok
-    };
-    if ok.as_bool() {
-        sz.cx
-    } else {
-        wide.len() as i32 * 7
-    }
+    g.gdi.text_width(s, g.fonts.get(t).0, 7)
 }
 
 /// Widths of the system items (physical pixels).
@@ -1046,29 +863,8 @@ pub fn resize(w: i32, h: i32) -> Result<(), String> {
     GFX.with(|c| {
         let mut b = c.borrow_mut();
         let Some(g) = b.as_mut() else { return Err("render not initialized".to_string()) };
-        if let Some(d) = &g.main {
-            if d.w == w && d.h == h {
-                return Ok(());
-            }
-        }
-        if let Some(d) = g.main.take() {
-            free_dib(g.dc_main, d);
-        }
-        if let Some(d) = g.txt.take() {
-            free_dib(g.dc_txt, d);
-        }
-        let main = make_dib(g.dc_main, w, h)?;
         let txt_h = g.fonts.max_lh() + 4;
-        let txt = match make_dib(g.dc_txt, w, txt_h) {
-            Ok(t) => t,
-            Err(e) => {
-                free_dib(g.dc_main, main);
-                return Err(e);
-            }
-        };
-        g.main = Some(main);
-        g.txt = Some(txt);
-        Ok(())
+        g.gdi.resize(w, h, txt_h)
     })
 }
 
@@ -1099,46 +895,17 @@ pub fn present_alpha(hwnd: HWND, x: i32, y: i32, alpha: u8) -> bool {
     let Some((dc_main, w, h)) = GFX.with(|c| {
         let b = c.borrow();
         let g = b.as_ref()?;
-        let d = g.main.as_ref()?;
-        Some((g.dc_main, d.w, d.h))
+        let (w, h) = g.gdi.size()?;
+        Some((g.gdi.dc_main(), w, h))
     }) else {
         return false;
     };
-    {
-        let pos = POINT { x, y };
-        let size = SIZE { cx: w, cy: h };
-        let src = POINT { x: 0, y: 0 };
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: alpha,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        // SAFETY: all pointers point to local variables alive for the call; `dc_main` has
-        // the DIB selected (a re-entry that recreates it still leaves a valid DC, which
-        // lives until `destroy` frees it); the screen DC is taken and released here.
-        let r = unsafe {
-            let screen = GetDC(None);
-            let r = UpdateLayeredWindow(
-                hwnd,
-                Some(screen),
-                Some(&pos),
-                Some(&size),
-                Some(dc_main),
-                Some(&src),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-            ReleaseDC(None, screen);
-            r
-        };
-        match r {
-            Ok(()) => true,
-            Err(e) => {
-                log!("UpdateLayeredWindow failed: {e}");
-                false
-            }
+    // The `GFX` borrow is released: the call may re-enter (the DC stays valid until `destroy`).
+    match crate::surface::present_layered(hwnd, dc_main, w, h, x, y, alpha) {
+        Ok(()) => true,
+        Err(e) => {
+            log!("UpdateLayeredWindow failed: {e}");
+            false
         }
     }
 }
@@ -1157,83 +924,13 @@ pub fn truncate_name(name: &str) -> String {
 
 /// Releases the GDI resources. Idempotent.
 pub fn destroy() {
-    let Some(mut g) = GFX.with(|c| c.borrow_mut().take()) else { return };
-    if let Some(d) = g.main.take() {
-        free_dib(g.dc_main, d);
-    }
-    if let Some(d) = g.txt.take() {
-        free_dib(g.dc_txt, d);
-    }
+    let Some(g) = GFX.with(|c| c.borrow_mut().take()) else { return };
     g.fonts.delete();
-    // SAFETY: DCs created in `init`; no object of ours is selected in them any more.
-    unsafe {
-        let _ = DeleteDC(g.dc_main);
-        let _ = DeleteDC(g.dc_txt);
-    }
+    // Dropping `g.gdi` frees the DIBs and the DCs.
 }
 
-// ------------------------------------------------------- pixel primitives
-
-#[inline]
-fn div255(x: u32) -> u32 {
-    (x + 128 + ((x + 128) >> 8)) >> 8
-}
-
-/// Premultiplied 0xAARRGGBB pixel from a non-premultiplied colour and alpha.
-#[inline]
-fn argb(a: u32, r: u32, g: u32, b: u32) -> u32 {
-    (a << 24) | (div255(r * a) << 16) | (div255(g * a) << 8) | div255(b * a)
-}
-
-/// White with alpha `a`, premultiplied.
-#[inline]
-fn white(a: u32) -> u32 {
-    argb(a, 255, 255, 255)
-}
-
-/// "Source over" compositing of `src` onto `dst`, both premultiplied.
-#[inline]
-fn over(dst: u32, src: u32) -> u32 {
-    let sa = src >> 24;
-    if sa == 255 {
-        return src;
-    }
-    if sa == 0 {
-        return dst;
-    }
-    let inv = 255 - sa;
-    let ch = |s: u32, d: u32| (s + div255(d * inv)).min(255);
-    (ch(src >> 24, dst >> 24) << 24)
-        | (ch((src >> 16) & 255, (dst >> 16) & 255) << 16)
-        | (ch((src >> 8) & 255, (dst >> 8) & 255) << 8)
-        | ch(src & 255, dst & 255)
-}
-
-/// Coverage (0..1) of pixel `(x, y)` with respect to the rounded rectangle `[l, r) x [t, b)` with
-/// radius `rad`: manual antialiasing at the corners only (the sides are pixel-aligned).
-fn rr_cov(x: i32, y: i32, l: i32, t: i32, r: i32, b: i32, rad: i32) -> f32 {
-    if x < l || x >= r || y < t || y >= b {
-        return 0.0;
-    }
-    let rad = rad.min((r - l) / 2).min((b - t) / 2).max(0);
-    let cx = if x < l + rad {
-        l + rad
-    } else if x >= r - rad {
-        r - rad
-    } else {
-        return 1.0;
-    };
-    let cy = if y < t + rad {
-        t + rad
-    } else if y >= b - rad {
-        b - rad
-    } else {
-        return 1.0;
-    };
-    let dx = (x as f32 + 0.5) - cx as f32;
-    let dy = (y as f32 + 0.5) - cy as f32;
-    (rad as f32 + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0)
-}
+// ------------------------------------------------------- background
+// The pixel primitives (`div255`, `argb`, `over`, `rr_cov`, `Canvas`) are the ones of `surface`.
 
 /// Bar background: `rgb` at alpha `bg_alpha` (premultiplied here; text and icons are composited over it
 /// at their own full alpha) with a white RGBA(255,255,255,22) border of `bw` px, antialiased rounded
@@ -1272,168 +969,16 @@ fn draw_bg(buf: &mut [u32], w: i32, h: i32, pw: i32, poff: i32, radius: i32, bw:
     }
 }
 
-/// Drawing surface: slice of the main DIB with its size.
-struct Canvas<'a> {
-    buf: &'a mut [u32],
-    w: i32,
-    h: i32,
-}
-
-impl Canvas<'_> {
-    #[inline]
-    fn blend(&mut self, x: i32, y: i32, src: u32) {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h {
-            return;
-        }
-        let i = (y * self.w + x) as usize;
-        self.buf[i] = over(self.buf[i], src);
-    }
-
-    /// Filled rounded rectangle with antialiasing, colour `(r,g,b)` and alpha `alpha`.
-    fn fill_rr(&mut self, rc: RECT, radius: i32, rgb: (u32, u32, u32), alpha: u32) {
-        if alpha == 0 {
-            return;
-        }
-        for y in rc.top.max(0)..rc.bottom.min(self.h) {
-            for x in rc.left.max(0)..rc.right.min(self.w) {
-                let cov = rr_cov(x, y, rc.left, rc.top, rc.right, rc.bottom, radius);
-                let a = (alpha as f32 * cov + 0.5) as u32;
-                if a > 0 {
-                    self.blend(x, y, argb(a, rgb.0, rgb.1, rgb.2));
-                }
-            }
-        }
-    }
-
-    /// 1 px (`bw`) inner border of a rounded rectangle: white ring with alpha `alpha`.
-    fn stroke_rr(&mut self, rc: RECT, radius: i32, bw: i32, alpha: u32) {
-        if alpha == 0 {
-            return;
-        }
-        for y in rc.top.max(0)..rc.bottom.min(self.h) {
-            for x in rc.left.max(0)..rc.right.min(self.w) {
-                let outer = rr_cov(x, y, rc.left, rc.top, rc.right, rc.bottom, radius);
-                let inner = rr_cov(x, y, rc.left + bw, rc.top + bw, rc.right - bw, rc.bottom - bw, radius - bw);
-                let a = (alpha as f32 * (outer - inner).max(0.0) + 0.5) as u32;
-                if a > 0 {
-                    self.blend(x, y, white(a));
-                }
-            }
-        }
-    }
-
-    /// Blends a premultiplied bitmap into the `size` x `size` square with corner `(x, y)`.
-    /// If the bitmap has a different size it is scaled (averaged when shrinking, else nearest-neighbour; transitional case: the icon at the
-    /// right size is arriving from the shell thread).
-    fn blit(&mut self, bmp: &IconBitmap, x: i32, y: i32, size: i32, opacity: u32) {
-        let (sw, sh) = (bmp.width as i32, bmp.height as i32);
-        if bmp.is_empty() || size <= 0 || bmp.pixels.len() < (sw as usize) * (sh as usize) {
-            return;
-        }
-        let same = sw == size && sh == size;
-        for dy in 0..size {
-            let yy = y + dy;
-            if yy < 0 || yy >= self.h {
-                continue;
-            }
-            let sy = if same { dy } else { dy * sh / size };
-            for dx in 0..size {
-                let xx = x + dx;
-                if xx < 0 || xx >= self.w {
-                    continue;
-                }
-                let sx = if same { dx } else { dx * sw / size };
-                let mut s = if same || (sw <= size && sh <= size) {
-                    bmp.pixels[(sy * sw + sx) as usize]
-                } else {
-                    // Shrinking (e.g. tray icons kept at 16 px for the popup): average, don't skip.
-                    crate::surface::area_sample(bmp, dx, dy, size)
-                };
-                if s >> 24 == 0 {
-                    continue;
-                }
-                if opacity < 255 {
-                    s = (div255((s >> 24) * opacity) << 24)
-                        | (div255(((s >> 16) & 255) * opacity) << 16)
-                        | (div255(((s >> 8) & 255) * opacity) << 8)
-                        | div255((s & 255) * opacity);
-                }
-                self.blend(xx, yy, s);
-            }
-        }
-    }
-
-    /// Draws in white a shape defined in 16x16 space by the function `inside`, in a
-    /// square of `size` pixels with corner `(x, y)`, with 4x4 supersampling.
-    fn vector(&mut self, x: i32, y: i32, size: i32, alpha: u32, inside: &dyn Fn(f32, f32) -> bool) {
-        if size <= 0 {
-            return;
-        }
-        glyphs::set_scale(size);
-        let k = 16.0 / size as f32;
-        for py in 0..size {
-            for px in 0..size {
-                let mut hits = 0u32;
-                for sy in 0..4 {
-                    for sx in 0..4 {
-                        let u = (px as f32 + (sx as f32 + 0.5) / 4.0) * k;
-                        let v = (py as f32 + (sy as f32 + 0.5) / 4.0) * k;
-                        if inside(u, v) {
-                            hits += 1;
-                        }
-                    }
-                }
-                if hits > 0 {
-                    self.blend(x + px, y + py, white(alpha * hits / 16));
-                }
-            }
-        }
-    }
-}
-
 // ------------------------------------------------------- vector icons
 // The shapes (bell, speaker, power, show desktop, chevron...) live in `glyphs`,
 // shared with the popups.
 
 // ------------------------------------------------------------------ text
 
-/// Draws `s` with its top-left corner at `(x, y)`: white grayscale GDI onto the black
-/// scratch DIB, then manual compositing with alpha `alpha` into the canvas.
+/// Draws `s` in white with its top-left corner at `(x, y)` and alpha `alpha` into the canvas,
+/// with font `t` (`Gdi::text`: grayscale GDI onto the scratch DIB, then manual compositing).
 fn draw_text(g: &Gfx, cv: &mut Canvas<'_>, s: &str, x: i32, y: i32, t: Txt, alpha: u32) {
-    let Some(txt) = g.txt.as_ref() else { return };
-    if s.is_empty() {
-        return;
-    }
-    let (font, lh) = g.fonts.get(t);
-    let w = text_width(g, s, t).min(txt.w);
-    let h = lh.min(txt.h);
-    if w <= 0 || h <= 0 {
-        return;
-    }
-    let tbuf = dib_pixels(txt);
-    for row in 0..h as usize {
-        let start = row * txt.w as usize;
-        tbuf[start..start + w as usize].fill(0);
-    }
-    let mut wide: Vec<u16> = s.encode_utf16().collect();
-    let mut rc = RECT { left: 0, top: 0, right: w, bottom: h };
-    // SAFETY: `dc_txt` has the scratch DIB selected; `wide` and `rc` outlive the call;
-    // the font is restored immediately. GdiFlush guarantees GDI has written before reading.
-    unsafe {
-        let old = SelectObject(g.dc_txt, HGDIOBJ(font.0));
-        DrawTextW(g.dc_txt, &mut wide, &mut rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
-        SelectObject(g.dc_txt, old);
-        let _ = GdiFlush();
-    }
-    for row in 0..h {
-        for col in 0..w {
-            let cov = (tbuf[(row * txt.w + col) as usize] >> 8) & 0xFF; // coverage = G channel
-            if cov == 0 {
-                continue;
-            }
-            cv.blend(x + col, y + row, white(div255(cov * alpha)));
-        }
-    }
+    g.gdi.text(cv, s, x, y, g.fonts.get(t), text_width(g, s, t), WHITE, alpha);
 }
 
 // ------------------------------------------------------------------ paint
@@ -1447,15 +992,9 @@ fn label_up(m: Metrics) -> i32 {
     }
 }
 
-fn rect_wh(x: i32, y: i32, w: i32, h: i32) -> RECT {
-    RECT { left: x, top: y, right: x + w, bottom: y + h }
-}
-
-fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
-    let (w, h) = match &g.main {
-        Some(d) => (d.w, d.h),
-        None => return,
-    };
+fn paint_inner(g: &Gfx, scene: &Scene<'_>, layout: &Layout) {
+    let Some(mut cv) = g.gdi.canvas(None) else { return };
+    let (w, h) = (cv.w, cv.h);
     if layout.width != w || layout.height != h {
         log!("render::paint: layout {}x{} differs from DIB {w}x{h}, skipping the frame", layout.width, layout.height);
         return;
@@ -1463,13 +1002,9 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
     let m = scene.metrics;
     let pw = if g.pill_w > 0 && g.pill_w < w { g.pill_w } else { w };
     let poff = (w - pw) / 2;
-    let Some(main) = g.main.as_ref() else { return };
-    let buf = dib_pixels(main);
     // The pill background is painted straight into the DIB (no heap copy).
     let cfg = crate::config::get();
-    draw_bg(buf, w, h, pw, poff, m.px(BAR_RADIUS), m.px(1).max(1), cfg.background.rgb(), cfg.bar_alpha());
-    let g: &Gfx = g;
-    let mut cv = Canvas { buf, w, h };
+    draw_bg(cv.buf, w, h, pw, poff, m.px(BAR_RADIUS), m.px(1).max(1), cfg.background.rgb(), cfg.bar_alpha());
 
     // Hover/press plate.
     if let Some(p) = scene.plate {
@@ -1599,20 +1134,20 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                     let tx = r.left + (r.right - r.left - tray_px) / 2;
                     let shape: &dyn Fn(f32, f32) -> bool =
                         if scene.bar_top { &glyphs::chevron_down_shape } else { &glyphs::chevron_up_shape };
-                    cv.vector(tx, cy - tray_px / 2, tray_px, glyph_a, shape);
+                    cv.glyph(tx, cy - tray_px / 2, tray_px, WHITE, glyph_a, shape);
                 }
                 ItemId::Notifications => {
                     let badge = scene.system.bell_badge;
                     if scene.system.bell_dnd {
-                        cv.vector(gx, gy, sys_icon, glyph_a, &|u, v| glyphs::bell_off_shape(u, v, badge));
+                        cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &|u, v| glyphs::bell_off_shape(u, v, badge));
                     } else if badge {
-                        cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::bell_badge_shape);
+                        cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &glyphs::bell_badge_shape);
                     } else {
-                        cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::bell_shape);
+                        cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &glyphs::bell_shape);
                     }
                     if badge {
                         // Badge always solid white, in the gap cut out around it in the bell.
-                        cv.vector(gx, gy, sys_icon, 255, &glyphs::badge_shape);
+                        cv.glyph(gx, gy, sys_icon, WHITE, 255, &glyphs::badge_shape);
                     }
                 }
                 ItemId::Volume => {
@@ -1622,7 +1157,7 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                     let waves = glyphs::waves_for(vol.level);
                     // Headphone glyph while the default device is headphones/headset (muted keeps the speaker).
                     let phones = !muted && crate::audio::default_is_headphone();
-                    cv.vector(x, gy, sys_icon, glyph_a, &|u, v| {
+                    cv.glyph(x, gy, sys_icon, WHITE, glyph_a, &|u, v| {
                         if phones {
                             glyphs::device_shape(u, v, crate::audio::DeviceKind::Headphones)
                         } else {
@@ -1663,23 +1198,25 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                         }
                     }
                 }
-                ItemId::ShowDesktop => cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::show_desktop_shape),
-                ItemId::Start => cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::windows_logo_shape),
-                ItemId::Power => cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::power_shape),
+                ItemId::ShowDesktop => cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &glyphs::show_desktop_shape),
+                ItemId::Start => cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &glyphs::windows_logo_shape),
+                ItemId::Power => cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &glyphs::power_shape),
                 ItemId::Network => {
                     let net = scene.system.net;
                     if net.kind == NetKind::Ethernet {
-                        cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::ethernet_shape);
+                        cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &glyphs::ethernet_shape);
                     } else {
                         // Wi-Fi: every arc dim, the lit ones on top (offline: all dim).
-                        cv.vector(gx, gy, sys_icon, glyph_a * NET_DIM_ALPHA / 255, &|u, v| glyphs::wifi_shape(u, v, 4));
+                        cv.glyph(gx, gy, sys_icon, WHITE, glyph_a * NET_DIM_ALPHA / 255, &|u, v| {
+                            glyphs::wifi_shape(u, v, 4)
+                        });
                         if net.kind == NetKind::Wifi {
-                            cv.vector(gx, gy, sys_icon, glyph_a, &|u, v| glyphs::wifi_shape(u, v, net.bars));
+                            cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &|u, v| glyphs::wifi_shape(u, v, net.bars));
                         }
                     }
                     // Corner badge: small globe = internet reachable, small x = no internet / offline.
                     let online = net.kind != NetKind::None && net.internet;
-                    cv.vector(gx, gy, sys_icon, glyph_a, &|u, v| glyphs::net_badge_shape(u, v, online));
+                    cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &|u, v| glyphs::net_badge_shape(u, v, online));
                 }
                 ItemId::Metrics => {
                     let u = scene.system.usage;
@@ -1711,11 +1248,7 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
 
 // PREVIEW-HOOK (used by `preview.rs`): copy of the main DIB's pixels (premultiplied 0xAARRGGBB).
 pub(crate) fn snapshot_pixels() -> Option<(i32, i32, Vec<u32>)> {
-    GFX.with(|c| {
-        let b = c.borrow();
-        let d = b.as_ref()?.main.as_ref()?;
-        Some((d.w, d.h, dib_pixels(d).to_vec()))
-    })
+    GFX.with(|c| c.borrow().as_ref()?.gdi.snapshot_pixels())
 }
 
 #[cfg(test)]

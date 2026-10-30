@@ -23,18 +23,15 @@ use crate::log;
 /// reproducible and do not depend on the machine they are rendered on.
 static PREVIEW: AtomicBool = AtomicBool::new(false);
 
-/// Enables the fixed locale / date / time used by `--preview`.
+/// Enables the fixed locale / date / time used by `--preview` (and English labels, `i18n`).
 pub fn set_preview(on: bool) {
     PREVIEW.store(on, Relaxed);
+    crate::i18n::set_preview(on);
 }
 
-/// Locale name for the NLS calls: user default (NULL) or `en-US` in preview mode.
+/// Locale name for the NLS calls: the dock language (`i18n::locale`; `en-US` in preview mode).
 fn locale() -> PCWSTR {
-    if PREVIEW.load(Relaxed) {
-        w!("en-US")
-    } else {
-        PCWSTR::null()
-    }
+    crate::i18n::locale()
 }
 
 /// One cell of the 6x7 grid.
@@ -126,6 +123,7 @@ pub fn first_day_of_week_sun0() -> u32 {
 /// (`CAL_SSHORTESTDAYNAME1..7`, note: 1 is Monday).
 pub fn weekday_headers(first_sun0: u32) -> [String; 7] {
     const FALLBACK: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+    const FALLBACK_IT: [&str; 7] = ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"];
     let mut out: [String; 7] = Default::default();
     for (i, slot) in out.iter_mut().enumerate() {
         // column i -> sun0 day -> index with Monday = 0
@@ -147,7 +145,7 @@ pub fn weekday_headers(first_sun0: u32) -> [String; 7] {
         *slot = if n > 1 {
             String::from_utf16_lossy(&buf[..(n as usize - 1).min(buf.len())])
         } else {
-            FALLBACK[mon0].to_string()
+            if crate::i18n::italian() { FALLBACK_IT[mon0] } else { FALLBACK[mon0] }.to_string()
         };
     }
     out

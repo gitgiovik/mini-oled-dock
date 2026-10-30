@@ -169,7 +169,7 @@ impl Content for NotifPopup {
         self.y_header = y;
         self.header_h = p(24);
         if !self.state.items.is_empty() && self.state.access == NotifAccess::Allowed {
-            let tw = s.text_width("Clear all", Font::Small);
+            let tw = s.text_width(crate::i18n::tr("Clear all", "Cancella tutto"), Font::Small);
             // Text right-aligned on the column (width - TEXT_COL); the plate sticks out 12 beyond the text.
             let rc = rect_wh(self.width - self.margin - tw - p(24), y, tw + p(24), self.header_h);
             self.hits.add(ID_CLEAR, rc);
@@ -268,12 +268,12 @@ impl Content for NotifPopup {
 
         // Header.
         let head = rect_wh(0, self.y_header, self.width, self.header_h);
-        s.text("Notifications", p(TEXT_COL), center_y(&head, lh_b), Font::Bold, WHITE, TEXT_ALPHA);
+        s.text(crate::i18n::tr("Notifications", "Notifiche"), p(TEXT_COL), center_y(&head, lh_b), Font::Bold, WHITE, TEXT_ALPHA);
         if let Some(rc) = self.hits.rect(ID_CLEAR) {
             row_plate(s, rc, ID_CLEAR, hot, pressed);
             let a = if hot == Some(ID_CLEAR) { TEXT_ALPHA } else { TEXT2_ALPHA };
-            let tw = s.text_width("Clear all", Font::Small);
-            s.text("Clear all", rc.right - p(12) - tw, center_y(&rc, lh_s), Font::Small, WHITE, a);
+            let tw = s.text_width(crate::i18n::tr("Clear all", "Cancella tutto"), Font::Small);
+            s.text(crate::i18n::tr("Clear all", "Cancella tutto"), rc.right - p(12) - tw, center_y(&rc, lh_s), Font::Small, WHITE, a);
         }
         hline(s, p(TEXT_COL), self.width - p(TEXT_COL), self.sep1);
 
@@ -281,14 +281,14 @@ impl Content for NotifPopup {
         let msg_rc = rect_wh(0, self.list.top, self.width, self.list.bottom - self.list.top);
         if self.state.access != NotifAccess::Allowed {
             let (txt, font) = if self.state.access == NotifAccess::Unknown {
-                ("Loading\u{2026}", Font::Small)
+                (crate::i18n::tr("Loading\u{2026}", "Caricamento\u{2026}"), Font::Small)
             } else {
-                ("List unavailable", Font::Small)
+                (crate::i18n::tr("List unavailable", "Elenco non disponibile"), Font::Small)
             };
             let tw = s.text_width(txt, font);
             s.text(txt, (self.width - tw) / 2, center_y(&msg_rc, s.line_height(font)), font, WHITE, TEXT3_ALPHA);
         } else if self.cards.is_empty() {
-            let txt = "No notifications";
+            let txt = crate::i18n::tr("No notifications", "Nessuna notifica");
             let tw = s.text_width(txt, Font::Normal);
             s.text(txt, (self.width - tw) / 2, center_y(&msg_rc, lh_n), Font::Normal, WHITE, TEXT2_ALPHA);
         } else {
@@ -358,11 +358,14 @@ impl Content for NotifPopup {
         // Do not disturb.
         if let (Some(rc), Some(dnd)) = (self.hits.rect(ID_DND), self.state.dnd) {
             let h = row_plate(s, rc, ID_DND, hot, pressed);
-            s.text("Do not disturb", rc.left + p(12), center_y(&rc, lh_n), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+            s.text(crate::i18n::tr("Do not disturb", "Non disturbare"), rc.left + p(12), center_y(&rc, lh_n), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
             let (sw_w, sw_h) = (p(32), p(18));
             toggle_switch(s, rc.right - p(12) - sw_w, rc.top + (rc.bottom - rc.top - sw_h) / 2, dnd);
         }
-        for (id, label) in [(ID_OPEN_CENTER, "Open notification center"), (ID_SETTINGS, "Notification settings")] {
+        for (id, label) in [
+            (ID_OPEN_CENTER, crate::i18n::tr("Open notification center", "Apri centro notifiche")),
+            (ID_SETTINGS, crate::i18n::tr("Notification settings", "Impostazioni notifiche")),
+        ] {
             let Some(rc) = self.hits.rect(id) else { continue };
             let h = row_plate(s, rc, id, hot, pressed);
             s.text(label, rc.left + p(12), center_y(&rc, lh_n), Font::Normal, WHITE, lift(TEXT_ALPHA, h));

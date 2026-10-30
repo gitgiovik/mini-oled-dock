@@ -43,15 +43,16 @@ impl AppPopup {
     fn rows(&self) -> Vec<(u32, String, bool)> {
         let mut v = Vec::new();
         if self.info.can_launch {
-            v.push((ID_MENU_NEW_WINDOW, "New window".to_string(), true));
+            v.push((ID_MENU_NEW_WINDOW, crate::i18n::tr("New window", "Nuova finestra").to_string(), true));
         }
         if self.info.pinned {
-            v.push((ID_MENU_UNPIN, "Unpin from dock".to_string(), true));
+            v.push((ID_MENU_UNPIN, crate::i18n::tr("Unpin from dock", "Rimuovi dal dock").to_string(), true));
         } else {
-            v.push((ID_MENU_PIN, "Pin to dock".to_string(), self.info.can_launch));
+            v.push((ID_MENU_PIN, crate::i18n::tr("Pin to dock", "Aggiungi al dock").to_string(), self.info.can_launch));
         }
         let close = match self.info.windows {
-            0 | 1 => "Close window".to_string(),
+            0 | 1 => crate::i18n::tr("Close window", "Chiudi finestra").to_string(),
+            n if crate::i18n::italian() => format!("Chiudi {n} finestre"),
             n => format!("Close {n} windows"),
         };
         v.push((ID_MENU_CLOSE_ALL, close, self.info.windows > 0));

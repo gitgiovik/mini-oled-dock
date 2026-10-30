@@ -78,6 +78,10 @@ pub const WM_SHELL_WAKE: u32 = WM_APP + 20;
 /// render device was changed/removed/added. The shell thread calls
 /// `AudioController::reopen_endpoint` and posts `WM_DOCK_VOLUME`. wParam = 0, lParam = 0.
 pub const WM_SHELL_AUDIO_DEVICE_CHANGED: u32 = WM_APP + 21;
+/// audio (short-lived `spatial-set` thread) -> shell thread: a `SetDefaultSpatialAudioFormatAsync`
+/// finished (whatever its status). If the audio popup is open the shell thread re-reads the spatial
+/// sound state and pushes `ShellEvent::Spatial`. wParam = 0, lParam = 0.
+pub const WM_SHELL_SPATIAL_CHANGED: u32 = WM_APP + 22;
 // The shell thread is asked to exit with WM_QUIT (PostThreadMessageW(WM_QUIT)).
 
 // --------------------------------------------------------------- timers (SetTimer)

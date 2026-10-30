@@ -726,14 +726,14 @@ fn format_time(ft: u64, now: u64) -> String {
         return hm;
     }
     if local_time(now.saturating_sub(DAY_FT)).is_some_and(|y| ymd(&y) == ymd(&t)) {
-        return format!("yesterday {hm}");
+        return format!("{} {hm}", crate::i18n::tr("yesterday", "ieri"));
     }
-    // Day and month names come from the user locale.
+    // Day and month names in the dock language (`i18n::locale`).
     let mut buf = [0u16; 48];
     // SAFETY: `t` and `buf` are valid for the duration of the call; the picture is a static NUL-terminated string.
     let n = unsafe {
         GetDateFormatEx(
-            PCWSTR::null(),
+            crate::i18n::locale(),
             ENUM_DATE_FORMATS_FLAGS(0),
             Some(&t),
             w!("ddd d MMM"),

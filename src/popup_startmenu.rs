@@ -15,7 +15,23 @@
 //!
 //! Left click launches the app (`shell:AppsFolder\<id>` through `ShellRequest::Launch`, so de-elevated
 //! like every launch of the dock) AFTER the popup closes. Right click on an app pins / unpins it
-//! (`config::toggle_start_pin`). No power buttons on purpose.
+//! (`config::toggle_start_pin`). No power buttons in this (vertical) style.
+//!
+//! HORIZONTAL STYLE (`config.start_style`, read when the menu opens): the same content with a second
+//! layout (`layout_h`) in the Windows 11 organization, sharing the store, the search, the pins and the
+//! launch: a wider fixed panel; the search box; "Pinned" with an "All apps" button; pages of
+//! `H_COLS * H_ROWS` tiles (wheel or page dots); "All apps" swaps the body for the alphabetical
+//! list ("Back" or Esc returns); a bottom bar with the user's initial and name (no picture) and a
+//! power button.
+//!
+//! POWER FLYOUT (horizontal style): the power button toggles a small rounded panel drawn by this
+//! popup itself over its own surface (no second window), right-aligned to the button and just above
+//! it, like the native Windows 11 one. It offers the entries of the power popup (`popup_power`:
+//! labels, glyphs and actions shared from there, without the autostart toggle): a system action runs
+//! after the Start closes, "Settings" switches to the Settings popup. While it is open a backdrop
+//! hit covers the rest of the menu: a click anywhere else, a right click or Esc closes only the
+//! flyout (Esc does not close the Start); typing closes it and goes on searching. It lives in the
+//! content, so it is gone when the Start closes.
 //!
 //! DATA: the catalog and the icons live in a UI-thread store (`STORE`) that outlives the popup, so the
 //! menu reopens instantly. Every open asks the shell thread for a fresh catalog
@@ -30,12 +46,18 @@ use std::collections::HashMap;
 
 use windows::Win32::Foundation::RECT;
 
+use crate::config::StartStyle;
+use crate::i18n::tr;
 use crate::icons::IconBitmap;
 use crate::log;
-use crate::popup::{center_y, lift, row_plate, Button, Content, DataEvent, HitMap, PopupKind, Reply};
+use crate::popup::{center_y, hline, lift, row_plate, Button, Content, DataEvent, HitMap, PopupKind, Reply};
+use crate::popup_power::{self, Choice};
+use crate::power::PowerAction;
 use crate::render::Metrics;
 use crate::shell_thread::{self, ShellRequest, StartApp};
-use crate::surface::{rect_wh, Font, Surface, HOVER_ALPHA, ROW_RADIUS, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE};
+use crate::surface::{
+    rect_wh, Font, Surface, HOVER_ALPHA, PANEL_BORDER_ALPHA, ROW_RADIUS, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE,
+};
 
 // ------------------------------------------------------------------ layout constants (logical px)
 
@@ -68,9 +90,55 @@ const STORE_ICON: i32 = TILE_ICON;
 /// Longest search text kept (chars).
 const MAX_QUERY: usize = 64;
 
+// Horizontal style (`layout_h`).
+/// Panel size: fixed.
+const HW: i32 = 640;
+const HH: i32 = 620;
+const H_INSET: i32 = 20;
+/// Pinned page: columns, rows, tiles per page, tile height, icon top inside a tile.
+const H_COLS: usize = 6;
+const H_ROWS: usize = 3;
+const H_PAGE: usize = H_COLS * H_ROWS;
+const H_TILE_H: i32 = 96;
+const H_TILE_ICON_TOP: i32 = 16;
+/// Header button ("All apps" / "Back"): height and horizontal text padding.
+const H_BTN_H: i32 = 26;
+const H_BTN_PAD: i32 = 12;
+/// Idle fill of the header button (a hover plate goes on top).
+const H_BTN_ALPHA: u32 = 16;
+/// Bottom bar: height, user circle diameter, power button side.
+const H_BAR_H: i32 = 60;
+const H_AVATAR: i32 = 32;
+const H_POWER: i32 = 36;
+/// Page dots: dot diameter and the side of each dot's hit square (also the spacing).
+const H_DOT: i32 = 6;
+const H_DOT_HIT: i32 = 16;
+/// Power flyout: width, row height, inner inset, gap above the power button, separator band,
+/// corner radius, margin kept from the panel edges.
+const FLY_W: i32 = 224;
+const FLY_ROW: i32 = 34;
+const FLY_INSET: i32 = 6;
+const FLY_GAP: i32 = 6;
+const FLY_SEP: i32 = 9;
+const FLY_RADIUS: i32 = 10;
+const FLY_MARGIN: i32 = 4;
+/// Power flyout fill over the panel colour (a lift that sets it apart) and its outline.
+const FLY_LIFT_ALPHA: u32 = 12;
+const FLY_RIM_ALPHA: u32 = PANEL_BORDER_ALPHA * 2;
+
 // ------------------------------------------------------------------ hit ids
 
 const ID_SEARCH: u32 = 1;
+/// Horizontal style: header button ("All apps" / "Back"), power button, page dot + page.
+const ID_ALL: u32 = 2;
+const ID_POWER: u32 = 3;
+const ID_DOT: u32 = 10;
+/// Most page dots drawn (ids stay below `ID_FLY_BACKDROP`).
+const MAX_DOTS: usize = 64;
+/// Power flyout open: the backdrop over the rest of the menu (closes the flyout) and, + a
+/// `popup_power` item id, the flyout rows.
+const ID_FLY_BACKDROP: u32 = 900;
+const ID_FLY: u32 = 910;
 /// + index of the pinned tile.
 const ID_PIN: u32 = 1_000;
 /// + index in the result list.
@@ -214,6 +282,16 @@ pub(crate) struct Geo {
     pub row_h: i32,
     /// Whole rows that fit the viewport (at least 1).
     pub rows: usize,
+    /// The list is on screen (always in the vertical style; the horizontal one shows it while
+    /// searching or on the "All apps" page).
+    pub list_shown: bool,
+    /// Horizontal style only: the header button, the pinned page area, the page dots, the bottom
+    /// bar and its power button.
+    pub button: Option<RECT>,
+    pub grid: RECT,
+    pub dots: Vec<RECT>,
+    pub bar: Option<RECT>,
+    pub power: Option<RECT>,
 }
 
 /// Layout for `pins` pinned apps to show (0 while searching).
@@ -240,7 +318,101 @@ pub(crate) fn layout(m: Metrics, pins: usize) -> Geo {
     let row_h = m.px(ROW_H).max(1);
     let list = RECT { left: inset, top: list_header.bottom, right: w - inset, bottom: h - inset };
     let rows = ((list.bottom - list.top) / row_h).max(1) as usize;
-    Geo { w, h, search, pins_header, tiles, list_header, list, row_h, rows }
+    Geo { w, h, search, pins_header, tiles, list_header, list, row_h, rows, list_shown: true, ..Geo::default() }
+}
+
+/// Horizontal layout. `pins`: pinned apps to page through (0 on the list); `page`: the page shown
+/// (clamped by the caller); `list`: the list replaces the pinned page (search or "All apps");
+/// `button_w`: width of the header button (physical px), `None` = no button (searching).
+pub(crate) fn layout_h(m: Metrics, pins: usize, page: usize, list: bool, button_w: Option<i32>) -> Geo {
+    let (w, h, inset, gap) = (m.px(HW), m.px(HH), m.px(H_INSET), m.px(GAP));
+    let inner = w - 2 * inset;
+    let search = rect_wh(inset, inset, inner, m.px(SEARCH_H));
+    let list_header = rect_wh(inset, search.bottom + gap + m.px(6), inner, m.px(HEADER_H));
+    let button = button_w.map(|bw| {
+        let bh = m.px(H_BTN_H);
+        rect_wh(list_header.right - bw, list_header.top + (list_header.bottom - list_header.top - bh) / 2, bw, bh)
+    });
+    let bar = RECT { left: 0, top: h - m.px(H_BAR_H), right: w, bottom: h };
+    let body = RECT { left: inset, top: list_header.bottom + m.px(6), right: w - inset, bottom: bar.top - gap };
+    let row_h = m.px(ROW_H).max(1);
+    let rows = ((body.bottom - body.top) / row_h).max(1) as usize;
+    let (tw, th) = (inner / H_COLS as i32, m.px(H_TILE_H));
+    let grid = RECT { bottom: body.top + H_ROWS as i32 * th, ..body };
+    let mut tiles = Vec::new();
+    let mut dots = Vec::new();
+    if !list {
+        let first = page * H_PAGE;
+        for i in 0..pins.saturating_sub(first).min(H_PAGE) {
+            let (r, c) = ((i / H_COLS) as i32, (i % H_COLS) as i32);
+            tiles.push(rect_wh(inset + c * tw, grid.top + r * th, tw, th));
+        }
+        let pages = pins.div_ceil(H_PAGE).min(MAX_DOTS);
+        if pages > 1 {
+            // A column in the right margin, centred on the grid.
+            let d = m.px(H_DOT_HIT);
+            let x = w - inset + (inset - d) / 2;
+            let y0 = grid.top + (grid.bottom - grid.top - pages as i32 * d) / 2;
+            dots = (0..pages as i32).map(|p| rect_wh(x, y0 + p * d, d, d)).collect();
+        }
+    }
+    let pw = m.px(H_POWER);
+    let power = rect_wh(w - inset - pw, bar.top + (bar.bottom - bar.top - pw) / 2, pw, pw);
+    Geo {
+        w,
+        h,
+        search,
+        pins_header: None,
+        tiles,
+        list_header,
+        list: body,
+        row_h,
+        rows,
+        list_shown: list,
+        button,
+        grid,
+        dots,
+        bar: Some(bar),
+        power: Some(power),
+    }
+}
+
+/// Power flyout layout, client coordinates, physical px.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Flyout {
+    pub panel: RECT,
+    /// `popup_power` item id and its row, in menu order.
+    pub rows: Vec<(u32, RECT)>,
+    /// Ordinate of the separator between the system actions and the dock entries.
+    pub sep_y: i32,
+}
+
+/// Flyout of a `w` x `h` panel for the power button `power`: right-aligned to the button and just
+/// above it, kept inside the panel. Rows: `popup_power::SYSTEM_ITEMS`, a separator,
+/// `popup_power::DOCK_ITEMS`.
+pub(crate) fn layout_flyout(m: Metrics, w: i32, h: i32, power: RECT) -> Flyout {
+    let (fw, row, inset, sep) = (m.px(FLY_W), m.px(FLY_ROW), m.px(FLY_INSET), m.px(FLY_SEP));
+    let n = (popup_power::SYSTEM_ITEMS.len() + popup_power::DOCK_ITEMS.len()) as i32;
+    let fh = 2 * inset + n * row + sep;
+    let margin = m.px(FLY_MARGIN);
+    let right = power.right.min(w - margin);
+    let left = (right - fw).max(margin);
+    let bottom = (power.top - m.px(FLY_GAP)).min(h - margin);
+    let top = (bottom - fh).max(margin);
+    let panel = RECT { left, top, right, bottom: top + fh };
+    let mut rows = Vec::with_capacity(n as usize);
+    let mut y = top + inset;
+    for id in popup_power::SYSTEM_ITEMS {
+        rows.push((id, rect_wh(left + inset, y, right - left - 2 * inset, row)));
+        y += row;
+    }
+    let sep_y = y + sep / 2;
+    y += sep;
+    for id in popup_power::DOCK_ITEMS {
+        rows.push((id, rect_wh(left + inset, y, right - left - 2 * inset, row)));
+        y += row;
+    }
+    Flyout { panel, rows, sep_y }
 }
 
 /// The end of `text` that fits in `max_w` (the start is dropped): the search box shows what is
@@ -276,32 +448,31 @@ struct Labels {
     hint: &'static str,
     loading: &'static str,
     none: &'static str,
+    /// Horizontal style: header buttons and the hint of an empty pinned page.
+    all_button: &'static str,
+    back: &'static str,
+    no_pins: &'static str,
 }
 
-const EN: Labels = Labels {
-    placeholder: "Type to search apps",
-    pinned: "Pinned",
-    all: "All apps",
-    results: "Results",
-    hint: "Right-click to pin",
-    loading: "Loading apps\u{2026}",
-    none: "No apps found",
-};
-
-const IT: Labels = Labels {
-    placeholder: "Scrivi per cercare un'app",
-    pinned: "Aggiunte",
-    all: "Tutte le app",
-    results: "Risultati",
-    hint: "Clic destro per fissare",
-    loading: "Caricamento app\u{2026}",
-    none: "Nessuna app trovata",
-};
+/// The labels in the dock language (`i18n::tr`, like every other popup; English in preview mode).
+fn labels() -> Labels {
+    Labels {
+        placeholder: tr("Type to search apps", "Scrivi per cercare un'app"),
+        pinned: tr("Pinned", "Aggiunte"),
+        all: tr("All apps", "Tutte le app"),
+        results: tr("Results", "Risultati"),
+        hint: tr("Right-click to pin", "Clic destro per fissare"),
+        loading: tr("Loading apps\u{2026}", "Caricamento app\u{2026}"),
+        none: tr("No apps found", "Nessuna app trovata"),
+        all_button: tr("All apps \u{203A}", "Tutte le app \u{203A}"),
+        back: tr("\u{2039} Back", "\u{2039} Indietro"),
+        no_pins: tr("Right-click an app in All apps to pin it", "Clic destro su un'app in Tutte le app per fissarla"),
+    }
+}
 
 // ------------------------------------------------------------------ content
 
 pub(crate) struct StartMenu {
-    labels: &'static Labels,
     m: Metrics,
     geo: Geo,
     query: String,
@@ -317,17 +488,36 @@ pub(crate) struct StartMenu {
     requested: bool,
     /// App id chosen, launched after the popup closes.
     pending: Option<String>,
+    /// Horizontal style (`config.start_style` at open time).
+    horiz: bool,
+    /// Horizontal: the "All apps" page replaces the pinned page.
+    all: bool,
+    /// Horizontal: pinned page shown.
+    page: usize,
+    /// Horizontal: Windows user name for the bottom bar (empty in the vertical style).
+    user: String,
+    /// Horizontal: widths of the "All apps" and "Back" buttons (physical px, set by `size`).
+    button_w: (i32, i32),
+    /// Horizontal: the power flyout is open, and its layout (set by `refresh`).
+    flyout: bool,
+    fly: Flyout,
+    /// Power action chosen in the flyout, run after the popup closes.
+    power_pending: Option<PowerAction>,
 }
 
-/// Creates the content; labels in the user's UI language (like the Start quick-links menu).
+/// Creates the content in the configured style; labels in the dock language (`i18n`).
 pub(crate) fn new() -> Box<dyn Content> {
-    let italian = crate::popup::popup_start::ui_is_italian();
-    Box::new(make(if italian { &IT } else { &EN }))
+    let mut c = make();
+    if crate::config::get().start_style == StartStyle::Horizontal {
+        c.horiz = true;
+        // The account name of the process (as GetUserNameW): no picture, nothing else loaded.
+        c.user = std::env::var("USERNAME").unwrap_or_default();
+    }
+    Box::new(c)
 }
 
-fn make(labels: &'static Labels) -> StartMenu {
+fn make() -> StartMenu {
     StartMenu {
-        labels,
         m: Metrics { dpi: 96 },
         geo: Geo::default(),
         query: String::new(),
@@ -338,12 +528,28 @@ fn make(labels: &'static Labels) -> StartMenu {
         hits: HitMap::default(),
         requested: false,
         pending: None,
+        horiz: false,
+        all: false,
+        page: 0,
+        user: String::new(),
+        button_w: (0, 0),
+        flyout: false,
+        fly: Flyout::default(),
+        power_pending: None,
     }
 }
 
 /// PREVIEW-HOOK: the menu over a mock catalog (`apps`: id, name, icon; the icons all of one size),
-/// English labels, `query` already typed. Replaces the store; asks the shell thread for nothing.
-pub(crate) fn preview_new(apps: Vec<(String, String, IconBitmap)>, query: &str) -> Box<dyn Content> {
+/// English labels (`--preview` puts `i18n` in preview mode), `query` already typed, in `style`
+/// (horizontal: `all` = on the "All apps" page, a fixed user name, `power` = the power flyout
+/// open). Replaces the store; asks the shell thread for nothing.
+pub(crate) fn preview_new(
+    apps: Vec<(String, String, IconBitmap)>,
+    query: &str,
+    style: StartStyle,
+    all: bool,
+    power: bool,
+) -> Box<dyn Content> {
     let px = apps.first().map_or(32, |a| a.2.width);
     STORE.with(|s| {
         if let Ok(mut s) = s.try_borrow_mut() {
@@ -352,8 +558,14 @@ pub(crate) fn preview_new(apps: Vec<(String, String, IconBitmap)>, query: &str) 
     });
     store_apps(apps.iter().map(|(id, name, _)| StartApp { id: id.clone(), name: name.clone() }).collect());
     store_icons(px, apps.into_iter().map(|(id, _, b)| (id, Some(b))).collect());
-    let mut c = make(&EN);
+    let mut c = make();
     c.requested = true;
+    if style == StartStyle::Horizontal {
+        c.horiz = true;
+        c.all = all;
+        c.user = "User".to_string();
+        c.flyout = power;
+    }
     c.query = query.to_string();
     if c.searching() {
         c.sel = Some(0);
@@ -383,8 +595,19 @@ impl StartMenu {
         });
         self.results = results;
         self.pins = pins;
-        self.geo = layout(self.m, self.pins.len());
-        self.pins.truncate(self.geo.tiles.len());
+        if self.horiz {
+            let list = self.list_mode();
+            self.page = self.page.min(self.pages() - 1);
+            let button = (!searching).then_some(if self.all { self.button_w.1 } else { self.button_w.0 });
+            self.geo = layout_h(self.m, if list { 0 } else { self.pins.len() }, self.page, list, button);
+            self.fly = match self.geo.power {
+                Some(p) => layout_flyout(self.m, self.geo.w, self.geo.h, p),
+                None => Flyout::default(),
+            };
+        } else {
+            self.geo = layout(self.m, self.pins.len());
+            self.pins.truncate(self.geo.tiles.len());
+        }
         self.scroll = self.scroll.min(self.max_scroll());
         if let Some(s) = self.sel {
             self.sel = if self.results.is_empty() { None } else { Some(s.min(self.results.len() - 1)) };
@@ -396,6 +619,34 @@ impl StartMenu {
         self.results.len().saturating_sub(self.geo.rows)
     }
 
+    /// Horizontal: the list replaces the pinned page (searching, or the "All apps" page).
+    fn list_mode(&self) -> bool {
+        self.searching() || self.all
+    }
+
+    /// Horizontal: pinned pages (at least 1, at most `MAX_DOTS`).
+    fn pages(&self) -> usize {
+        self.pins.len().div_ceil(H_PAGE).clamp(1, MAX_DOTS)
+    }
+
+    /// Index into `pins` of the first tile shown.
+    fn pin_base(&self) -> usize {
+        if self.horiz {
+            self.page * H_PAGE
+        } else {
+            0
+        }
+    }
+
+    /// Horizontal: shows the "All apps" page (`true`) or back to the pinned page.
+    fn show_all(&mut self, on: bool) -> Reply {
+        self.all = on;
+        self.scroll = 0;
+        self.sel = None;
+        self.refresh();
+        Reply::Redraw
+    }
+
     /// Rectangle of the `k`-th visible row.
     fn row_rect(&self, k: usize) -> RECT {
         let g = &self.geo;
@@ -405,18 +656,61 @@ impl StartMenu {
     }
 
     fn rebuild_hits(&mut self) {
-        let rows: Vec<(u32, RECT)> = (0..self.geo.rows)
+        let shown = if self.geo.list_shown { self.geo.rows } else { 0 };
+        let rows: Vec<(u32, RECT)> = (0..shown)
             .map(|k| (k, self.scroll + k))
             .take_while(|&(_, i)| i < self.results.len())
             .map(|(k, i)| (ID_ROW + i as u32, self.row_rect(k)))
             .collect();
         self.hits.clear();
         self.hits.add(ID_SEARCH, self.geo.search);
-        for (i, rc) in self.geo.tiles.iter().enumerate().take(self.pins.len()) {
+        let n = self.pins.len().saturating_sub(self.pin_base());
+        for (i, rc) in self.geo.tiles.iter().enumerate().take(n) {
             self.hits.add(ID_PIN + i as u32, *rc);
         }
         for (id, rc) in rows {
             self.hits.add(id, rc);
+        }
+        if let Some(b) = self.geo.button {
+            self.hits.add(ID_ALL, b);
+        }
+        for (p, rc) in self.geo.dots.iter().enumerate() {
+            self.hits.add(ID_DOT + p as u32, *rc);
+        }
+        if let Some(p) = self.geo.power {
+            self.hits.add(ID_POWER, p);
+            if self.flyout {
+                // On top of everything (the last added wins): the backdrop, the power button again
+                // (it toggles the flyout), then the flyout rows.
+                self.hits.add(ID_FLY_BACKDROP, RECT { left: 0, top: 0, right: self.geo.w, bottom: self.geo.h });
+                self.hits.add(ID_POWER, p);
+                for &(id, rc) in &self.fly.rows {
+                    self.hits.add(ID_FLY + id, rc);
+                }
+            }
+        }
+    }
+
+    /// Opens or closes the power flyout (horizontal style only).
+    fn set_flyout(&mut self, on: bool) -> Reply {
+        let on = on && self.geo.power.is_some();
+        if on == self.flyout {
+            return Reply::None;
+        }
+        self.flyout = on;
+        self.rebuild_hits();
+        Reply::Redraw
+    }
+
+    /// A row of the flyout was chosen: an action runs after the popup closes, "Settings" switches.
+    fn choose_power(&mut self, item: u32) -> Reply {
+        match popup_power::choice(item) {
+            Some(Choice::Settings) => Reply::Switch(PopupKind::Settings),
+            Some(Choice::Run(a)) => {
+                self.power_pending = Some(a);
+                Reply::Close
+            }
+            None => Reply::None,
         }
     }
 
@@ -439,7 +733,7 @@ impl StartMenu {
     /// Store index of the app behind hit `id` (pin tile or list row).
     fn app_at(&self, id: u32) -> Option<usize> {
         if (ID_PIN..ID_ROW).contains(&id) {
-            self.pins.get((id - ID_PIN) as usize).copied()
+            self.pins.get(self.pin_base() + (id - ID_PIN) as usize).copied()
         } else if id >= ID_ROW {
             self.results.get((id - ID_ROW) as usize).copied()
         } else {
@@ -498,7 +792,7 @@ impl StartMenu {
         let ty = center_y(&g.search, lh);
         let max_w = g.search.right - m.px(12) - tx;
         let caret_x = if self.query.is_empty() {
-            s.text(self.labels.placeholder, tx, ty, Font::Normal, WHITE, TEXT3_ALPHA);
+            s.text(labels().placeholder, tx, ty, Font::Normal, WHITE, TEXT3_ALPHA);
             tx
         } else {
             let shown = tail_fit(s, &self.query, max_w);
@@ -526,34 +820,166 @@ impl StartMenu {
         }
     }
 
+    /// A pinned tile: hover plate, icon `icon_top` below the tile top, the name under it.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tile(s: &mut Surface, st: &Store, rc: &RECT, app: &App, id: u32, icon_top: i32, hot: Option<u32>, pressed: Option<u32>) {
+        let m = s.metrics();
+        let ti = m.px(TILE_ICON);
+        let lh_small = s.line_height(Font::Small);
+        let plate = RECT { left: rc.left + m.px(2), top: rc.top, right: rc.right - m.px(2), bottom: rc.bottom };
+        let lit = row_plate(s, plate, id, hot, pressed);
+        let tw = rc.right - rc.left;
+        let iy = rc.top + icon_top;
+        Self::paint_icon(s, &st.icons, &app.id, rc.left + (tw - ti) / 2, iy, ti);
+        let name = s.ellipsize(&app.name, Font::Small, tw - m.px(10));
+        let nx = rc.left + (tw - s.text_width(&name, Font::Small)) / 2;
+        let ny = iy + ti + m.px(8);
+        debug_assert!(ny + lh_small <= rc.bottom + m.px(4));
+        s.text(&name, nx, ny, Font::Small, WHITE, lift(TEXT_ALPHA, lit));
+    }
+
     fn paint_body(&self, s: &mut Surface, st: &Store, hot: Option<u32>, pressed: Option<u32>) {
         let m = s.metrics();
         let g = &self.geo;
         // Pinned grid.
         if let Some(hh) = g.pins_header {
-            Self::paint_header(s, hh, self.labels.pinned, None);
+            Self::paint_header(s, hh, labels().pinned, None);
         }
-        let ti = m.px(TILE_ICON);
-        let lh_small = s.line_height(Font::Small);
         for (i, (rc, &idx)) in g.tiles.iter().zip(&self.pins).enumerate() {
             let Some(app) = st.apps.get(idx) else { continue };
-            let plate = RECT { left: rc.left + m.px(2), top: rc.top, right: rc.right - m.px(2), bottom: rc.bottom };
-            let lit = row_plate(s, plate, ID_PIN + i as u32, hot, pressed);
-            let tw = rc.right - rc.left;
-            let iy = rc.top + m.px(10);
-            Self::paint_icon(s, &st.icons, &app.id, rc.left + (tw - ti) / 2, iy, ti);
-            let name = s.ellipsize(&app.name, Font::Small, tw - m.px(10));
-            let nx = rc.left + (tw - s.text_width(&name, Font::Small)) / 2;
-            let ny = iy + ti + m.px(8);
-            debug_assert!(ny + lh_small <= rc.bottom + m.px(4));
-            s.text(&name, nx, ny, Font::Small, WHITE, lift(TEXT_ALPHA, lit));
+            Self::paint_tile(s, st, rc, app, ID_PIN + i as u32, m.px(10), hot, pressed);
         }
         // App list.
-        let title = if self.searching() { self.labels.results } else { self.labels.all };
-        Self::paint_header(s, g.list_header, title, Some(self.labels.hint));
+        let title = if self.searching() { labels().results } else { labels().all };
+        Self::paint_header(s, g.list_header, title, Some(labels().hint));
+        self.paint_list(s, st, hot, pressed);
+    }
+
+    /// Horizontal style: header with its button, pinned page or list, bottom bar.
+    fn paint_body_h(&self, s: &mut Surface, st: &Store, hot: Option<u32>, pressed: Option<u32>) {
+        let m = s.metrics();
+        let g = &self.geo;
+        let list = self.list_mode();
+        // Header: title on the left, the button on the right, the pin hint before it on the list.
+        let title = if self.searching() {
+            labels().results
+        } else if self.all {
+            labels().all
+        } else {
+            labels().pinned
+        };
+        let head = RECT { right: g.button.map_or(g.list_header.right, |b| b.left - m.px(8)), ..g.list_header };
+        Self::paint_header(s, head, title, list.then_some(labels().hint));
+        if let Some(b) = g.button {
+            let r = m.px(ROW_RADIUS);
+            s.fill_rr(b, r, WHITE, H_BTN_ALPHA);
+            let lit = row_plate(s, b, ID_ALL, hot, pressed);
+            let text = if self.all { labels().back } else { labels().all_button };
+            let tx = b.left + (b.right - b.left - s.text_width(text, Font::Small)) / 2;
+            s.text(text, tx, center_y(&b, s.line_height(Font::Small)), Font::Small, WHITE, lift(TEXT_ALPHA, lit));
+        }
+        if list {
+            self.paint_list(s, st, hot, pressed);
+        } else if self.pins.is_empty() {
+            // Nothing pinned (or the catalog still loading while pins are configured).
+            let waiting = !st.loaded && !crate::config::get().start_pins.is_empty();
+            let msg = if waiting { labels().loading } else { labels().no_pins };
+            let msg = s.ellipsize(msg, Font::Normal, g.grid.right - g.grid.left);
+            let w = s.text_width(&msg, Font::Normal);
+            let x = g.grid.left + (g.grid.right - g.grid.left - w) / 2;
+            let y = center_y(&g.grid, s.line_height(Font::Normal));
+            s.text(&msg, x, y, Font::Normal, WHITE, TEXT3_ALPHA);
+        } else {
+            let base = self.pin_base();
+            for (i, rc) in g.tiles.iter().enumerate() {
+                let Some(app) = self.pins.get(base + i).and_then(|&idx| st.apps.get(idx)) else { continue };
+                Self::paint_tile(s, st, rc, app, ID_PIN + i as u32, m.px(H_TILE_ICON_TOP), hot, pressed);
+            }
+            let d = m.px(H_DOT).max(2);
+            for (p, rc) in g.dots.iter().enumerate() {
+                let id = ID_DOT + p as u32;
+                let a = if p == self.page {
+                    220
+                } else if hot == Some(id) {
+                    140
+                } else {
+                    70
+                };
+                let (cx, cy) = ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
+                s.fill_rr(rect_wh(cx - d / 2, cy - d / 2, d, d), d / 2, WHITE, a);
+            }
+        }
+        self.paint_bar(s, hot, pressed);
+    }
+
+    /// Horizontal style: separator, user circle with the initial, user name, power button.
+    fn paint_bar(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>) {
+        let (Some(bar), Some(power)) = (self.geo.bar, self.geo.power) else { return };
+        let m = s.metrics();
+        hline(s, bar.left, bar.right, bar.top);
+        let inset = m.px(H_INSET);
+        let d = m.px(H_AVATAR);
+        let circle = rect_wh(inset, bar.top + (bar.bottom - bar.top - d) / 2, d, d);
+        s.fill_rr(circle, d / 2, WHITE, 40);
+        let initial: String = self.user.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+        if !initial.is_empty() {
+            let x = circle.left + (d - s.text_width(&initial, Font::Bold)) / 2;
+            s.text(&initial, x, center_y(&circle, s.line_height(Font::Bold)), Font::Bold, WHITE, TEXT_ALPHA);
+        }
+        let nx = circle.right + m.px(12);
+        let name = s.ellipsize(&self.user, Font::Normal, power.left - m.px(16) - nx);
+        s.text(&name, nx, center_y(&bar, s.line_height(Font::Normal)), Font::Normal, WHITE, TEXT_ALPHA);
+        let mut lit = row_plate(s, power, ID_POWER, hot, pressed);
+        if !lit && self.flyout {
+            // The button stays lit while its flyout is open.
+            s.plate(power, m.px(ROW_RADIUS), HOVER_ALPHA);
+            lit = true;
+        }
+        let gs = m.px(16);
+        let gx = power.left + (power.right - power.left - gs) / 2;
+        let gy = power.top + (power.bottom - power.top - gs) / 2;
+        s.glyph(gx, gy, gs, lift(TEXT2_ALPHA, lit), &crate::glyphs::power_shape);
+    }
+
+    /// Horizontal style, flyout open: a raised rounded panel over the menu with the power rows
+    /// (icon and label as in the power popup, the same hover / pressed plates).
+    fn paint_flyout(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>) {
+        if !self.flyout || self.fly.rows.is_empty() {
+            return;
+        }
+        let m = s.metrics();
+        let f = &self.fly;
+        let r = m.px(FLY_RADIUS);
+        // Soft shadow, opaque base in the panel colour, a lift and an outline.
+        let g = m.px(2).max(1);
+        let shadow = RECT { left: f.panel.left - g, top: f.panel.top - g, right: f.panel.right + g, bottom: f.panel.bottom + 2 * g };
+        s.fill_rr(shadow, r + g, (0, 0, 0), 120);
+        s.fill_rr(f.panel, r, crate::config::get().background.rgb(), 255);
+        s.fill_rr(f.panel, r, WHITE, FLY_LIFT_ALPHA);
+        s.stroke_rr(f.panel, r, m.px(1).max(1), FLY_RIM_ALPHA);
+        let pad = m.px(12);
+        hline(s, f.panel.left + pad, f.panel.right - pad, f.sep_y);
+        let icon = m.px(16);
+        let lh = s.line_height(Font::Normal);
+        for &(item, rc) in &f.rows {
+            let lit = row_plate(s, rc, ID_FLY + item, hot, pressed);
+            let a = lift(popup_power::alpha(item), lit);
+            let shape = popup_power::shape(item);
+            s.glyph(rc.left + pad, rc.top + (rc.bottom - rc.top - icon) / 2, icon, a, &shape);
+            let tx = rc.left + pad + icon + m.px(8);
+            let label = s.ellipsize(popup_power::label(item), Font::Normal, rc.right - pad - tx);
+            s.text(&label, tx, center_y(&rc, lh), Font::Normal, WHITE, a);
+        }
+    }
+
+    /// The app list (results, or all apps): rows, keyboard selection, scroll bar; a message when
+    /// empty or still loading.
+    fn paint_list(&self, s: &mut Surface, st: &Store, hot: Option<u32>, pressed: Option<u32>) {
+        let m = s.metrics();
+        let g = &self.geo;
         let lh = s.line_height(Font::Normal);
         if !st.loaded || self.results.is_empty() {
-            let msg = if st.loaded { self.labels.none } else { self.labels.loading };
+            let msg = if st.loaded { labels().none } else { labels().loading };
             let w = s.text_width(msg, Font::Normal);
             let x = g.list.left + (g.list.right - g.list.left - w) / 2;
             s.text(msg, x, g.list.top + m.px(24), Font::Normal, WHITE, TEXT3_ALPHA);
@@ -598,6 +1024,10 @@ impl Content for StartMenu {
 
     fn size(&mut self, s: &Surface) -> (i32, i32) {
         self.m = s.metrics();
+        if self.horiz {
+            let bw = |t: &str| s.text_width(t, Font::Small) + 2 * self.m.px(H_BTN_PAD);
+            self.button_w = (bw(labels().all_button), bw(labels().back));
+        }
         if !self.requested {
             self.requested = true;
             request_catalog(self.m.px(STORE_ICON).max(8) as u32);
@@ -610,9 +1040,11 @@ impl Content for StartMenu {
         s.panel();
         self.paint_search(s);
         STORE.with(|st| match st.try_borrow() {
+            Ok(st) if self.horiz => self.paint_body_h(s, &st, hot, pressed),
             Ok(st) => self.paint_body(s, &st, hot, pressed),
             Err(_) => log!("startmenu: store busy while painting"),
         });
+        self.paint_flyout(s, hot, pressed);
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<u32> {
@@ -620,10 +1052,24 @@ impl Content for StartMenu {
     }
 
     fn clickable(&self, id: u32) -> bool {
-        id != ID_SEARCH
+        id != ID_SEARCH && id != ID_FLY_BACKDROP
     }
 
     fn click(&mut self, id: u32) -> Reply {
+        match id {
+            ID_ALL => return self.show_all(!self.all),
+            // The power flyout opens over the menu (the Start stays open).
+            ID_POWER => return self.set_flyout(!self.flyout),
+            // A click elsewhere while the flyout is open closes only the flyout.
+            ID_FLY_BACKDROP => return self.set_flyout(false),
+            _ if self.flyout && (ID_FLY..ID_PIN).contains(&id) => return self.choose_power(id - ID_FLY),
+            _ if (ID_DOT..ID_DOT + MAX_DOTS as u32).contains(&id) => {
+                self.page = (id - ID_DOT) as usize;
+                self.refresh();
+                return Reply::Redraw;
+            }
+            _ => {}
+        }
         match self.app_at(id) {
             Some(idx) => self.choose(idx),
             None => Reply::None,
@@ -631,6 +1077,10 @@ impl Content for StartMenu {
     }
 
     fn button(&mut self, id: u32, which: Button) -> Reply {
+        if self.flyout {
+            // Any other button over the menu closes the flyout, nothing else.
+            return self.set_flyout(false);
+        }
         if which != Button::Right {
             return Reply::None;
         }
@@ -645,6 +1095,20 @@ impl Content for StartMenu {
     }
 
     fn wheel(&mut self, notches: i32, _x: i32, _y: i32) -> Reply {
+        if self.flyout {
+            // The menu behind the flyout stays still.
+            return Reply::None;
+        }
+        if self.horiz && !self.list_mode() {
+            // Pinned page: one page per notch.
+            let next = (self.page as i64 - notches as i64).clamp(0, self.pages() as i64 - 1) as usize;
+            if next == self.page {
+                return Reply::None;
+            }
+            self.page = next;
+            self.refresh();
+            return Reply::Redraw;
+        }
         let next = (self.scroll as i64 - notches as i64 * WHEEL_ROWS).clamp(0, self.max_scroll() as i64) as usize;
         if next == self.scroll {
             return Reply::None;
@@ -655,6 +1119,14 @@ impl Content for StartMenu {
     }
 
     fn key(&mut self, vk: u16) -> Option<Reply> {
+        if self.flyout {
+            // Esc closes only the flyout (handled: the Start stays open); other keys wait for it.
+            return Some(if vk == VK_ESCAPE { self.set_flyout(false) } else { Reply::None });
+        }
+        if self.horiz && !self.list_mode() && matches!(vk, VK_DOWN | VK_UP | VK_NEXT | VK_PRIOR | VK_HOME | VK_END) {
+            // Horizontal pinned page: no list to move in.
+            return Some(Reply::None);
+        }
         let page = self.geo.rows.max(1) as i64;
         Some(match vk {
             VK_DOWN => self.move_sel(1),
@@ -681,6 +1153,8 @@ impl Content for StartMenu {
                 self.query.clear();
                 self.query_changed()
             }
+            // Horizontal: Esc on the "All apps" page goes back to the pinned page.
+            VK_ESCAPE if self.horiz && self.all => self.show_all(false),
             _ => return None,
         })
     }
@@ -689,6 +1163,8 @@ impl Content for StartMenu {
         if c.is_control() || (c.is_whitespace() && self.query.is_empty()) || self.query.chars().count() >= MAX_QUERY {
             return Reply::None;
         }
+        // Typing closes the flyout and goes on searching.
+        self.flyout = false;
         self.query.push(c);
         self.query_changed()
     }
@@ -701,7 +1177,15 @@ impl Content for StartMenu {
         Reply::Redraw
     }
 
+    fn closing(&mut self) {
+        self.flyout = false;
+    }
+
     fn after_close(&mut self) {
+        if let Some(a) = self.power_pending.take() {
+            popup_power::run(a);
+            return;
+        }
         if let Some(id) = self.pending.take() {
             log!("startmenu: launching '{id}'");
             crate::ui::launch_target_str(&format!("shell:AppsFolder\\{id}"));
@@ -751,6 +1235,135 @@ mod tests {
         let seven = layout(M, 7);
         assert_eq!(seven.tiles[6].left, seven.tiles[0].left);
         assert_eq!(seven.tiles[6].top, seven.tiles[0].bottom);
+    }
+
+    #[test]
+    fn horizontal_layout_pages_and_stays_inside() {
+        // One full page, no dots.
+        let one = layout_h(M, 18, 0, false, Some(90));
+        assert_eq!((one.w, one.h), (HW, HH));
+        assert_eq!(one.tiles.len(), H_PAGE);
+        assert!(one.dots.is_empty() && !one.list_shown);
+        // 6 columns x 3 rows: the 7th tile starts the second row, the last is bottom right.
+        assert_eq!(one.tiles[6].left, one.tiles[0].left);
+        assert_eq!(one.tiles[6].top, one.tiles[0].bottom);
+        assert_eq!(one.tiles[17].bottom, one.grid.bottom);
+        // 20 pins: two pages, the second one with 2 tiles, one dot per page.
+        let p0 = layout_h(M, 20, 0, false, Some(90));
+        let p1 = layout_h(M, 20, 1, false, Some(90));
+        assert_eq!((p0.tiles.len(), p1.tiles.len()), (H_PAGE, 2));
+        assert_eq!((p0.dots.len(), p1.dots.len()), (2, 2));
+        // List page: no tiles, rows fill the body above the bottom bar.
+        let list = layout_h(M, 0, 0, true, None);
+        assert!(list.list_shown && list.tiles.is_empty() && list.button.is_none() && list.rows > 8);
+        for g in [&one, &p0, &p1, &list] {
+            let bar = g.bar.unwrap();
+            let power = g.power.unwrap();
+            assert!(g.grid.bottom <= bar.top && g.list.bottom <= bar.top);
+            assert!(g.list.top + g.rows as i32 * g.row_h <= g.list.bottom);
+            assert!(power.right <= g.w && power.top >= bar.top && power.bottom <= g.h);
+            assert!(g.tiles.iter().all(|t| t.right <= g.w - H_INSET && t.top >= g.list_header.bottom));
+            assert!(g.dots.iter().all(|d| d.left >= g.w - H_INSET && d.right <= g.w));
+            if let Some(b) = g.button {
+                assert!(b.right == g.list_header.right && b.top >= g.list_header.top && b.bottom <= g.list_header.bottom);
+            }
+        }
+        let big = layout_h(Metrics { dpi: 144 }, 3, 0, false, None);
+        assert_eq!((big.w, big.h), (HW * 3 / 2, HH * 3 / 2));
+    }
+
+    #[test]
+    fn horizontal_menu_pages_by_wheel_and_toggles_all_apps() {
+        let mut c = make();
+        c.horiz = true;
+        c.requested = true;
+        c.button_w = (90, 70);
+        c.pins = (0..40).collect();
+        assert_eq!(c.pages(), 3);
+        c.geo = layout_h(M, c.pins.len(), 0, false, Some(90));
+        assert!(!c.list_mode());
+        // Pin ids map through the page.
+        c.page = 1;
+        assert_eq!(c.app_at(ID_PIN), Some(H_PAGE));
+        c.all = true;
+        assert!(c.list_mode());
+        // The vertical style never offsets the pins.
+        let mut v = make();
+        v.pins = vec![4, 5];
+        v.page = 3;
+        assert_eq!(v.app_at(ID_PIN + 1), Some(5));
+    }
+
+    #[test]
+    fn power_flyout_sits_above_the_power_button_inside_the_panel() {
+        for dpi in [96, 120, 144, 192] {
+            let m = Metrics { dpi };
+            let g = layout_h(m, 8, 0, false, Some(90));
+            let power = g.power.unwrap();
+            let f = layout_flyout(m, g.w, g.h, power);
+            let p = f.panel;
+            // Inside the popup.
+            assert!(p.left >= 0 && p.top >= 0 && p.right <= g.w && p.bottom <= g.h, "dpi {dpi}: {p:?}");
+            // Above the power button, right-aligned to it, over the body (not the bottom bar).
+            assert!(p.bottom <= power.top && p.bottom >= power.top - m.px(FLY_GAP) - 1);
+            assert_eq!(p.right, power.right);
+            assert!(p.left < power.left && p.top > g.search.bottom);
+            // One row per shared power item, in order, inside the flyout, the separator between
+            // the system actions and the dock entries.
+            let ids: Vec<u32> = f.rows.iter().map(|r| r.0).collect();
+            let want: Vec<u32> = popup_power::SYSTEM_ITEMS.iter().chain(&popup_power::DOCK_ITEMS).copied().collect();
+            assert_eq!(ids, want);
+            for (_, rc) in &f.rows {
+                assert!(rc.left >= p.left && rc.right <= p.right && rc.top >= p.top && rc.bottom <= p.bottom);
+            }
+            let k = popup_power::SYSTEM_ITEMS.len();
+            assert!(f.rows[k - 1].1.bottom <= f.sep_y && f.sep_y < f.rows[k].1.top);
+            // Every item maps to a choice (an action or Settings).
+            assert!(want.iter().all(|&id| popup_power::choice(id).is_some()));
+        }
+        // A panel too small: the flyout is kept inside it anyway.
+        let f = layout_flyout(M, 100, 120, rect_wh(60, 80, 36, 36));
+        assert!(f.panel.left >= 0 && f.panel.top >= 0 && f.panel.right <= 100);
+    }
+
+    #[test]
+    fn power_flyout_toggles_and_esc_closes_only_it() {
+        let mut c = make();
+        c.horiz = true;
+        c.requested = true;
+        c.button_w = (90, 70);
+        c.refresh();
+        assert!(!c.flyout);
+        assert_eq!(c.click(ID_POWER), Reply::Redraw);
+        assert!(c.flyout);
+        // The backdrop covers the menu, the flyout rows sit on top of it.
+        let (_, rc) = c.fly.rows[0];
+        assert_eq!(c.hit(rc.left + 2, rc.top + 2), Some(ID_FLY + popup_power::SYSTEM_ITEMS[0]));
+        assert_eq!(c.hit(c.geo.search.left + 2, c.geo.search.top + 2), Some(ID_FLY_BACKDROP));
+        let pw = c.geo.power.unwrap();
+        assert_eq!(c.hit(pw.left + 2, pw.top + 2), Some(ID_POWER));
+        // Esc is handled (the Start does not close) and closes the flyout.
+        assert_eq!(c.key(VK_ESCAPE), Some(Reply::Redraw));
+        assert!(!c.flyout);
+        assert_eq!(c.hit(c.geo.search.left + 2, c.geo.search.top + 2), Some(ID_SEARCH));
+        // A click on the backdrop closes it; the power button toggles it.
+        c.click(ID_POWER);
+        assert_eq!(c.click(ID_FLY_BACKDROP), Reply::Redraw);
+        assert!(!c.flyout);
+        c.click(ID_POWER);
+        c.click(ID_POWER);
+        assert!(!c.flyout);
+        // Settings switches; an action closes the Start and waits for `after_close`.
+        c.click(ID_POWER);
+        assert_eq!(c.click(ID_FLY + popup_power::ID_SETTINGS), Reply::Switch(PopupKind::Settings));
+        assert_eq!(c.click(ID_FLY + popup_power::ID_LOCK), Reply::Close);
+        assert_eq!(c.power_pending, Some(PowerAction::Lock));
+        c.power_pending = None;
+        // The vertical style has no power button: no flyout.
+        let mut v = make();
+        v.refresh();
+        assert_eq!(v.click(ID_POWER), Reply::None);
+        assert!(!v.flyout);
     }
 
     #[test]

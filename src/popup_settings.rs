@@ -1,6 +1,7 @@
-//! SETTINGS popup (from "Settings" in the power popup): the dock's own options on three short pages.
+//! SETTINGS popup (from "Settings" in the power popup): the dock's own options on four short pages.
 //!
-//!  * Main page. Appearance: position and display mode (segmented choices drawn by hand), then
+//!  * Main page. Appearance: language, Start menu style (vertical / horizontal, with a separate "›"
+//!    opening the Start menu page), position and display mode (segmented choices drawn by hand), then
 //!    "Background ›" and "Sizes ›" (sub-pages). Behavior: auto-hide, window previews, clock seconds (switches).
 //!    Modules: the Start button switch, one switch per system module (`config::MODULE_NAMES` mechanism)
 //!    and, with the tray on, "Choose tray icons" (switches to the tray popup in chooser mode).
@@ -8,6 +9,8 @@
 //!    a hand-drawn colour picker (saturation/value square, hue strip, preview and hex code), and the
 //!    background opacity slider (0-100 %).
 //!  * Sizes page: app icons, app names, tray icons and modules sliders, and "Reset sizes".
+//!  * Start menu page: "Import from Windows Start" (`start_import`), the row showing the import
+//!    status (importing, imported N apps, failed).
 //!
 //! Every change applies LIVE. Clicks, wheel steps and the end of a drag save through `config::modify`
 //! (the commented template survives); while a slider or the picker is being dragged the change is only
@@ -15,7 +18,8 @@
 //! (throttled while dragging) asks the dock window to rebuild the bar outside this popup's wnd_proc.
 //! If the file cannot be written the change still applies for this session.
 //! No timer, thread or system object: when the popup closes nothing of it keeps running (a drag still
-//! unsaved at that point is saved by `closing`).
+//! unsaved at that point is saved by `closing`). The only exception is the Start import, a one-shot
+//! thread of `start_import` that ends with its job; its result is read on the popup's 1 s tick.
 
 use std::sync::Arc;
 
@@ -23,12 +27,14 @@ use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::{
-    self, Background, Config, DisplayMode, Position, SizeRange, APP_ICON_SIZE, APP_TEXT_SIZE, BACKGROUND_PRESETS,
+    self, Background, Config, DisplayMode, Language, Position, SizeRange, StartStyle, APP_ICON_SIZE, APP_TEXT_SIZE, BACKGROUND_PRESETS,
     MODULE_SIZE, TRAY_ICON_SIZE,
 };
 use crate::glyphs;
+use crate::i18n::tr;
 use crate::log;
 use crate::msg::WM_DOCK_CONFIG_APPLY;
+use crate::start_import;
 use crate::popup::{self, center_y, hline, lift, row_plate, tick_ms, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::surface::{rect_wh, Font, Surface, PRESS_ALPHA, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, TEXT_COL, WHITE};
 use crate::ui::Screen;
@@ -50,14 +56,16 @@ const PICKER_GAP: i32 = 10;
 /// Segmented control: height, horizontal text padding of a segment (logical px).
 const SEG_H: i32 = 20;
 const SEG_PAD: i32 = 7;
+/// Choice row with a sub-page: width of the "›" hit area at the right end, gap before it (logical px).
+const ARROW_W: i32 = 22;
+const ARROW_GAP: i32 = 2;
 /// Segmented control alphas: track fill and outline, hovered segment.
 const SEG_TRACK_ALPHA: u32 = 14;
 const SEG_RIM_ALPHA: u32 = 40;
 const SEG_HOT_ALPHA: u32 = 26;
 /// Outline of the swatches and of the colour preview (visible on a panel of the same colour).
 const SWATCH_RIM_ALPHA: u32 = 70;
-/// Slider: track thickness and knob radius, as in the audio popup (logical px).
-const TRACK_H: i32 = 4;
+/// Slider knob radius, as in the audio popup (logical px; the track is `popup::paint_slider`'s).
 const KNOB_R: i32 = 7;
 /// Minimum interval between two live bar rebuilds while dragging (ms).
 const APPLY_THROTTLE_MS: u64 = 30;
@@ -74,17 +82,25 @@ pub(crate) enum Page {
     Main,
     Background,
     Sizes,
+    /// Start menu options (the import from the Windows Start).
+    StartMenu,
 }
 
 /// A setting changed by a choice or a switch.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Setting {
+    /// `config.language`: System / English / Italiano.
+    Language,
+    /// `config.start_style`: Vertical / Horizontal.
+    StartStyle,
     Position,
     /// Display the bar sits on (`config.monitor`); offered only with two or more displays.
     Monitor,
     Display,
     AutoHide,
     Previews,
+    /// `config.win_opens_start`: Win opens / closes the Start menu together with the bar.
+    WinStart,
     Seconds,
     /// `Config::module_visible` name.
     Module(&'static str),
@@ -107,6 +123,8 @@ enum Item {
     ColourSection,
     /// Label + segmented choice.
     Choice(Setting, &'static str),
+    /// Label + segmented choice + a separate "›" (the part after the segments) opening a sub-page.
+    ChoiceMore(Setting, &'static str, Page),
     /// Label + switch (the whole row is clickable).
     Toggle(Setting, &'static str),
     /// "›" row opening a sub-page.
@@ -115,6 +133,8 @@ enum Item {
     Back(&'static str),
     /// "Choose tray icons" link.
     TrayChooser,
+    /// "Import from Windows Start": the label, or the status of the import (`start_import`).
+    ImportStart,
     /// Preset swatches + the custom swatch (opens / closes the picker).
     Swatches,
     /// Colour picker (only while open).
@@ -130,19 +150,25 @@ enum Item {
 fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> {
     match page {
         Page::Main => {
-            let mut v = vec![Item::Section("Appearance"), Item::Choice(Setting::Position, "Position")];
+            let mut v = vec![
+                Item::Section(tr("Appearance", "Aspetto")),
+                Item::Choice(Setting::Language, tr("Language", "Lingua")),
+                Item::ChoiceMore(Setting::StartStyle, tr("Start menu", "Menu Start"), Page::StartMenu),
+                Item::Choice(Setting::Position, tr("Position", "Posizione")),
+            ];
             if sc.len() > 1 {
-                v.push(Item::Choice(Setting::Monitor, "Screen"));
+                v.push(Item::Choice(Setting::Monitor, tr("Screen", "Schermo")));
             }
             v.extend([
-                Item::Choice(Setting::Display, "Display"),
-                Item::Open(Page::Background, "Background"),
-                Item::Open(Page::Sizes, "Sizes"),
-                Item::Section("Behavior"),
-                Item::Toggle(Setting::AutoHide, "Auto-hide"),
-                Item::Toggle(Setting::Previews, "Window previews"),
-                Item::Toggle(Setting::Seconds, "Clock seconds"),
-                Item::Section("Modules"),
+                Item::Choice(Setting::Display, tr("Display", "Mostra")),
+                Item::Open(Page::Background, tr("Background", "Sfondo")),
+                Item::Open(Page::Sizes, tr("Sizes", "Dimensioni")),
+                Item::Section(tr("Behavior", "Comportamento")),
+                Item::Toggle(Setting::AutoHide, tr("Auto-hide", "Nascondi automaticamente")),
+                Item::Toggle(Setting::Previews, tr("Window previews", "Anteprime finestre")),
+                Item::Toggle(Setting::WinStart, tr("Win key opens Start", "Il tasto Win apre Start")),
+                Item::Toggle(Setting::Seconds, tr("Clock seconds", "Secondi nell'orologio")),
+                Item::Section(tr("Modules", "Moduli")),
                 // The Start button is a fixed item at the left end of the bar, not part of `MODULE_NAMES`.
                 Item::Toggle(Setting::Module("start"), module_label("start")),
             ]);
@@ -153,48 +179,56 @@ fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> 
             v
         }
         Page::Background => {
-            let mut v = vec![Item::Back("Background"), Item::ColourSection, Item::Swatches];
+            let mut v = vec![Item::Back(tr("Background", "Sfondo")), Item::ColourSection, Item::Swatches];
             if picker_open {
                 v.push(Item::Picker);
             }
-            v.push(Item::Slider(Slider::Opacity, "Opacity"));
+            v.push(Item::Slider(Slider::Opacity, tr("Opacity", "Opacit\u{e0}")));
             v
         }
         Page::Sizes => vec![
-            Item::Back("Sizes"),
-            Item::Slider(Slider::AppIcon, "App icons"),
-            Item::Slider(Slider::AppText, "App names"),
-            Item::Slider(Slider::TrayIcon, "Tray icons"),
-            Item::Slider(Slider::Module, "Modules"),
+            Item::Back(tr("Sizes", "Dimensioni")),
+            Item::Slider(Slider::AppIcon, tr("App icons", "Icone app")),
+            Item::Slider(Slider::AppText, tr("App names", "Nomi app")),
+            Item::Slider(Slider::TrayIcon, tr("Tray icons", "Icone area notifiche")),
+            Item::Slider(Slider::Module, tr("Modules", "Moduli")),
             Item::ResetSizes,
         ],
+        Page::StartMenu => vec![Item::Back(tr("Start menu", "Menu Start")), Item::ImportStart],
     }
 }
 
 /// Row label of a `config::MODULE_NAMES` entry (or "start").
 fn module_label(name: &str) -> &'static str {
     match name {
-        "notifications" => "Notifications",
-        "volume" => "Volume",
-        "network" => "Network",
-        "metrics" => "System metrics",
-        "clock" => "Clock",
-        "show_desktop" => "Show desktop",
-        "start" => "Start button",
-        "tray" => "Tray icons",
-        _ => "Module",
+        "notifications" => tr("Notifications", "Notifiche"),
+        "volume" => tr("Volume", "Volume"),
+        "network" => tr("Network", "Rete"),
+        "metrics" => tr("System metrics", "Risorse di sistema"),
+        "clock" => tr("Clock", "Orologio"),
+        "show_desktop" => tr("Show desktop", "Mostra desktop"),
+        "start" => tr("Start button", "Pulsante Start"),
+        "tray" => tr("Tray icons", "Icone area notifiche"),
+        _ => tr("Module", "Modulo"),
     }
 }
 
 /// Labels of the segments of a choice (`sc`: the displays, for the screen choice).
 fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
     match s {
-        Setting::Position => vec!["Top", "Bottom"],
+        // Each language in its own name, so it can be found whatever the current one is.
+        Setting::Language => vec![tr("System", "Sistema"), "English", "Italiano"],
+        Setting::StartStyle => vec![tr("Vertical", "Verticale"), tr("Horizontal", "Orizzontale")],
+        Setting::Position => vec![tr("Top", "In alto"), tr("Bottom", "In basso")],
         Setting::Monitor => {
             // Last segment: follow the pointer (`config::MONITOR_POINTER`).
-            sc.iter().map(|d| if d.primary { "Main" } else { d.label }).chain(std::iter::once("Pointer")).collect()
+            let main = tr("Main", "Principale");
+            sc.iter()
+                .map(|d| if d.primary { main } else { d.label })
+                .chain(std::iter::once(tr("Pointer", "Puntatore")))
+                .collect()
         }
-        Setting::Display => vec!["Icon + name", "Icon", "Name"],
+        Setting::Display => vec![tr("Icon + name", "Icona + nome"), tr("Icon", "Icona"), tr("Name", "Nome")],
         _ => Vec::new(),
     }
 }
@@ -203,6 +237,12 @@ fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
 /// when none is chosen or the chosen one is not connected (that is where the bar is).
 fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
     Some(match s {
+        Setting::Language => match c.language {
+            Language::Auto => 0,
+            Language::En => 1,
+            Language::It => 2,
+        },
+        Setting::StartStyle => usize::from(c.start_style == StartStyle::Horizontal),
         Setting::Position => usize::from(c.position == Position::Bottom),
         Setting::Monitor => {
             if c.monitor.eq_ignore_ascii_case(config::MONITOR_POINTER) {
@@ -224,6 +264,8 @@ fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
 /// primary monitor even if Windows changes which one it is).
 fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
     match s {
+        Setting::Language => c.language = [Language::Auto, Language::En, Language::It][j.min(2)],
+        Setting::StartStyle => c.start_style = if j == 0 { StartStyle::Vertical } else { StartStyle::Horizontal },
         Setting::Position => c.position = if j == 0 { Position::Top } else { Position::Bottom },
         Setting::Monitor => {
             c.monitor = if j == sc.len() {
@@ -243,6 +285,7 @@ fn is_on(c: &Config, s: Setting) -> bool {
     match s {
         Setting::AutoHide => c.autohide,
         Setting::Previews => c.window_previews,
+        Setting::WinStart => c.win_opens_start,
         Setting::Seconds => c.show_seconds,
         Setting::Module(n) => c.module_visible(n),
         _ => false,
@@ -253,6 +296,7 @@ fn flip(c: &mut Config, s: Setting) {
     match s {
         Setting::AutoHide => c.autohide = !c.autohide,
         Setting::Previews => c.window_previews = !c.window_previews,
+        Setting::WinStart => c.win_opens_start = !c.win_opens_start,
         Setting::Seconds => c.show_seconds = !c.show_seconds,
         Setting::Module(n) => {
             let on = c.module_visible(n);
@@ -356,6 +400,13 @@ fn background_of((h, s, v): (f32, f32, f32)) -> Background {
     Background(r << 16 | g << 8 | b)
 }
 
+/// Name of preset `k` in the dock language (the table keeps the English one).
+fn preset_name(k: usize) -> &'static str {
+    const IT: [&str; 7] = ["Nero", "Grafite", "Ardesia", "Blu notte", "Prugna", "Vinaccia", "Verde bosco"];
+    let en = BACKGROUND_PRESETS.get(k).map_or("", |p| p.0);
+    crate::i18n::tr(en, IT.get(k).copied().unwrap_or(en))
+}
+
 /// Index of the preset equal to `bg`.
 fn preset_index(bg: Background) -> Option<usize> {
     BACKGROUND_PRESETS.iter().position(|(_, p)| *p == bg)
@@ -396,6 +447,26 @@ pub(crate) struct SettingsPopup {
     /// Time of the last `WM_DOCK_CONFIG_APPLY`, and a rebuild skipped by the throttle.
     last_apply: u64,
     apply_pending: bool,
+    /// Last `start_import::status_word` drawn (the tick redraws when the import reports back).
+    import_seen: u32,
+}
+
+/// Text of the import row for `st`.
+fn import_label(st: start_import::Status) -> String {
+    match st {
+        start_import::Status::Idle => tr("Import from Windows Start", "Importa dallo Start di Windows").to_string(),
+        start_import::Status::Running => tr("Importing\u{2026}", "Importazione\u{2026}").to_string(),
+        start_import::Status::Failed => tr("Import failed", "Importazione non riuscita").to_string(),
+        start_import::Status::Imported(n) => {
+            if crate::i18n::italian() {
+                format!("Importate {n} app")
+            } else if n == 1 {
+                "Imported 1 app".to_string()
+            } else {
+                format!("Imported {n} apps")
+            }
+        }
+    }
 }
 
 /// Creates the content from the current config, on the main page.
@@ -444,6 +515,8 @@ impl SettingsPopup {
         let cfg = config::get();
         let picker_open = page == Page::Background && preset_index(cfg.background).is_none();
         let screens = crate::ui::screens();
+        // A finished import's result belongs to the popup that started it.
+        start_import::reset();
         SettingsPopup {
             items: items(&cfg, page, picker_open, &screens),
             screens,
@@ -461,6 +534,7 @@ impl SettingsPopup {
             unsaved: false,
             last_apply: 0,
             apply_pending: false,
+            import_seen: start_import::status_word(),
         }
     }
 
@@ -531,10 +605,8 @@ impl SettingsPopup {
     /// Value of slider item `i` at the client abscissa `x`.
     fn slider_at(&self, i: usize, sl: Slider, x: i32) -> Option<i32> {
         let rc = self.hits.rect(item_id(i, Some(0)))?;
-        let (l, r) = (rc.left + self.knob_r, rc.right - self.knob_r);
         let (lo, hi, _, _) = slider_range(sl);
-        let span = (r - l).max(1);
-        Some(lo + ((x - l).clamp(0, span) * (hi - lo) + span / 2) / span)
+        Some(popup::slider_value_at(&rc, self.knob_r, lo, hi, x))
     }
 
     /// Sets the colour from the picker state (`hsv`), in memory while dragging.
@@ -558,16 +630,8 @@ impl SettingsPopup {
         let val = format!("{v}{unit}");
         let vw = s.text_width(&val, Font::Normal);
         s.text(&val, self.width - col - vw, y + m.px(6), Font::Normal, WHITE, lift(TEXT2_ALPHA, hot));
-        // Track as in the audio popup: dim rail, bright fill up to the knob, white knob.
-        let r = self.knob_r;
-        let (tl, tr) = (rc.left + r, rc.right - r);
-        let cy = (rc.top + rc.bottom) / 2;
-        let th = m.px(TRACK_H);
-        let rail = RECT { left: rc.left, top: cy - th / 2, right: rc.right, bottom: cy - th / 2 + th };
-        s.fill_rr(rail, th / 2, WHITE, 60);
-        let kx = tl + (tr - tl) * (v - lo) / (hi - lo).max(1);
-        s.fill_rr(RECT { right: kx, ..rail }, th / 2, WHITE, 230);
-        s.fill_rr(RECT { left: kx - r, top: cy - r, right: kx + r, bottom: cy + r }, r, WHITE, 255);
+        // Same slider as the audio popup.
+        popup::paint_slider(s, &rc, self.knob_r, lo, hi, v);
     }
 
     fn paint_swatches(&self, s: &mut Surface, i: usize, hot: Option<u32>) {
@@ -663,15 +727,22 @@ impl Content for SettingsPopup {
             let rc = rect_wh(inset, y, self.width - 2 * inset, h);
             match *it {
                 Item::Section(_) | Item::ColourSection => {}
-                Item::Choice(set, _) => {
-                    // Segments right-aligned on the switches' right edge.
+                Item::Choice(set, _) | Item::ChoiceMore(set, _, _) => {
+                    let more = matches!(it, Item::ChoiceMore(..));
+                    // Segments right-aligned on the switches' right edge, or before the "›" of a
+                    // row with a sub-page (its own hit area, the part after the segments).
                     let ws = self.seg_widths(s, set);
                     let sh = m.px(SEG_H);
-                    let mut x = rc.right - m.px(12) - ws.iter().sum::<i32>();
+                    let end = if more { rc.right - m.px(ARROW_W) - m.px(ARROW_GAP) } else { rc.right - m.px(12) };
+                    let mut x = end - ws.iter().sum::<i32>();
                     let sy = y + (h - sh) / 2;
                     for (j, w) in ws.iter().enumerate() {
                         self.hits.add(item_id(i, Some(j)), rect_wh(x, sy, *w, sh));
                         x += w;
+                    }
+                    if more {
+                        let aw = m.px(ARROW_W);
+                        self.hits.add(item_id(i, Some(ws.len())), rect_wh(rc.right - aw, y, aw, h));
                     }
                 }
                 Item::Swatches => {
@@ -702,7 +773,12 @@ impl Content for SettingsPopup {
                     let band = RECT { left: col, top: cy - m.px(10), right: self.width - col, bottom: cy + m.px(10) };
                     self.hits.add(item_id(i, Some(0)), band);
                 }
-                Item::Toggle(..) | Item::Open(..) | Item::Back(_) | Item::TrayChooser | Item::ResetSizes => {
+                Item::Toggle(..)
+                | Item::Open(..)
+                | Item::Back(_)
+                | Item::TrayChooser
+                | Item::ImportStart
+                | Item::ResetSizes => {
                     self.hits.add(item_id(i, None), rc)
                 }
             }
@@ -735,17 +811,27 @@ impl Content for SettingsPopup {
                 }
                 Item::ColourSection => {
                     let ty = y + h - lsm - m.px(4);
-                    s.text("Colour", col, ty, Font::Small, WHITE, TEXT3_ALPHA);
+                    s.text(tr("Colour", "Colore"), col, ty, Font::Small, WHITE, TEXT3_ALPHA);
                     let bg = self.cfg.background;
-                    let name = preset_index(bg).map_or_else(|| "Custom".to_string(), |k| BACKGROUND_PRESETS[k].0.to_string());
+                    let name = preset_index(bg).map_or_else(|| tr("Custom", "Personalizzato").to_string(), |k| preset_name(k).to_string());
                     let nw = s.text_width(&name, Font::Small);
                     s.text(&name, self.width - col - nw, ty, Font::Small, WHITE, TEXT2_ALPHA);
                 }
-                Item::Choice(set, label) => {
+                Item::Choice(set, label) | Item::ChoiceMore(set, label, _) => {
                     s.text(label, col, center_y(&row, ln), Font::Normal, WHITE, TEXT_ALPHA);
                     let sel = selected(&self.cfg, set, &self.screens);
                     let opts = options(set, &self.screens);
                     let n = opts.len();
+                    if matches!(it, Item::ChoiceMore(..)) {
+                        // The "›" to the sub-page, with its own hover plate.
+                        let id = item_id(i, Some(n));
+                        if let Some(rc) = self.hits.rect(id) {
+                            let lit = row_plate(s, rc, id, hot, pressed);
+                            let cw = s.text_width("\u{203A}", Font::Normal);
+                            let ty = center_y(&rc, ln);
+                            s.text("\u{203A}", rc.left + (rc.right - rc.left - cw) / 2, ty, Font::Normal, WHITE, lift(TEXT2_ALPHA, lit));
+                        }
+                    }
                     let (Some(first), Some(last)) =
                         (self.hits.rect(item_id(i, Some(0))), self.hits.rect(item_id(i, Some(n - 1))))
                     else {
@@ -810,9 +896,21 @@ impl Content for SettingsPopup {
                 Item::TrayChooser => {
                     let lit = row_plate(s, row, item_id(i, None), hot, pressed);
                     let ty = center_y(&row, ln);
-                    s.text("Choose tray icons", row.left + m.px(12), ty, Font::Normal, WHITE, lift(TEXT_ALPHA, lit));
+                    s.text(tr("Choose tray icons", "Scegli icone area notifiche"), row.left + m.px(12), ty, Font::Normal, WHITE, lift(TEXT_ALPHA, lit));
                     let cw = s.text_width("\u{203A}", Font::Normal);
                     chevron(s, &row, "\u{203A}", row.right - m.px(12) - cw, lit);
+                }
+                Item::ImportStart => {
+                    let st = start_import::status();
+                    let busy = st == start_import::Status::Running;
+                    let lit = !busy && row_plate(s, row, item_id(i, None), hot, pressed);
+                    let a = match st {
+                        start_import::Status::Idle => lift(TEXT_ALPHA, lit),
+                        start_import::Status::Running => TEXT3_ALPHA,
+                        _ => lift(TEXT2_ALPHA, lit),
+                    };
+                    let text = s.ellipsize(&import_label(st), Font::Normal, row.right - row.left - m.px(24));
+                    s.text(&text, row.left + m.px(12), center_y(&row, ln), Font::Normal, WHITE, a);
                 }
                 Item::Swatches => self.paint_swatches(s, i, hot),
                 Item::Picker => self.paint_picker(s),
@@ -824,7 +922,7 @@ impl Content for SettingsPopup {
                     let enabled = !sizes_are_default(&self.cfg);
                     let lit = enabled && row_plate(s, row, item_id(i, None), hot, pressed);
                     let a = if enabled { lift(TEXT_ALPHA, lit) } else { TEXT3_ALPHA };
-                    s.text("Reset sizes", row.left + m.px(12), center_y(&row, ln), Font::Normal, WHITE, a);
+                    s.text(tr("Reset sizes", "Ripristina dimensioni"), row.left + m.px(12), center_y(&row, ln), Font::Normal, WHITE, a);
                 }
             }
         }
@@ -839,8 +937,13 @@ impl Content for SettingsPopup {
         match (self.items.get(i), part) {
             // The segment already selected does nothing.
             (Some(Item::Choice(set, _)), Some(j)) => selected(&self.cfg, *set, &self.screens) != Some(j),
+            // The segment already selected does nothing; the part after the segments is the "›".
+            (Some(Item::ChoiceMore(set, _, _)), Some(j)) => {
+                j == options(*set, &self.screens).len() || selected(&self.cfg, *set, &self.screens) != Some(j)
+            }
             (Some(Item::Swatches), Some(k)) => k == BACKGROUND_PRESETS.len() || !swatch_selected(self.cfg.background, k),
             (Some(Item::ResetSizes), _) => !sizes_are_default(&self.cfg),
+            (Some(Item::ImportStart), _) => start_import::status() != start_import::Status::Running,
             _ => true,
         }
     }
@@ -851,6 +954,16 @@ impl Content for SettingsPopup {
             (Some(Item::Choice(set, _)), Some(j)) if selected(&self.cfg, set, &self.screens) != Some(j) => {
                 let sc = self.screens.clone();
                 self.change(move |c| choose(c, set, j, &sc), true)
+            }
+            (Some(Item::ChoiceMore(set, _, page)), Some(j)) => {
+                if j == options(set, &self.screens).len() {
+                    self.goto(page)
+                } else if selected(&self.cfg, set, &self.screens) != Some(j) {
+                    let sc = self.screens.clone();
+                    self.change(move |c| choose(c, set, j, &sc), true)
+                } else {
+                    Reply::None
+                }
             }
             (Some(Item::Toggle(set, _)), None) => self.change(|c| flip(c, set), true),
             (Some(Item::Open(page, _)), None) => self.goto(page),
@@ -874,6 +987,13 @@ impl Content for SettingsPopup {
                 }
             },
             (Some(Item::ResetSizes), None) if !sizes_are_default(&self.cfg) => self.change(reset_sizes, true),
+            (Some(Item::ImportStart), None) => {
+                if !start_import::start() {
+                    return Reply::None;
+                }
+                self.import_seen = start_import::status_word();
+                Reply::Redraw
+            }
             _ => Reply::None,
         }
     }
@@ -913,6 +1033,11 @@ impl Content for SettingsPopup {
             self.apply_pending = false;
             self.last_apply = tick_ms();
             post_apply();
+        }
+        let st = start_import::status_word();
+        if st != self.import_seen {
+            self.import_seen = st;
+            return Reply::Redraw;
         }
         Reply::None
     }
@@ -960,7 +1085,7 @@ mod tests {
     fn choices_roundtrip() {
         let mut c = Config::default();
         let sc = test_screens();
-        for set in [Setting::Position, Setting::Monitor, Setting::Display] {
+        for set in [Setting::Language, Setting::StartStyle, Setting::Position, Setting::Monitor, Setting::Display] {
             for j in 0..options(set, &sc).len() {
                 choose(&mut c, set, j, &sc);
                 assert_eq!(selected(&c, set, &sc), Some(j));
@@ -1006,6 +1131,7 @@ mod tests {
         for set in [
             Setting::AutoHide,
             Setting::Previews,
+            Setting::WinStart,
             Setting::Seconds,
             Setting::Module("metrics"),
             Setting::Module("tray"),
@@ -1034,6 +1160,65 @@ mod tests {
     }
 
     #[test]
+    fn start_style_row_fits_in_both_languages() {
+        let m = crate::render::Metrics { dpi: 96 };
+        let s = Surface::new(m).expect("surface");
+        for (label, opts) in [("Start menu", ["Vertical", "Horizontal"]), ("Menu Start", ["Verticale", "Orizzontale"])] {
+            let segs: i32 = opts.iter().map(|o| (s.text_width(o, Font::Small) + 2 * m.px(SEG_PAD)).max(m.px(30))).sum();
+            // Segments end before the "›" of the Start menu page.
+            let seg_left = m.px(WIDTH) - m.px(8) - m.px(ARROW_W) - m.px(ARROW_GAP) - segs;
+            assert!(m.px(TEXT_COL) + s.text_width(label, Font::Normal) + m.px(6) <= seg_left, "{label} overlaps its choice");
+        }
+        for st in [start_import::Status::Idle, start_import::Status::Running, start_import::Status::Failed, start_import::Status::Imported(3)] {
+            assert!(!import_label(st).is_empty());
+        }
+        assert_eq!(import_label(start_import::Status::Imported(1)), "Imported 1 app");
+    }
+
+    #[test]
+    fn start_menu_import_lives_on_its_own_page() {
+        let c = Config::default();
+        let main = items(&c, Page::Main, false, &[]);
+        // No import row on the main page: the Start menu choice opens the page instead.
+        assert!(!main.iter().any(|i| matches!(i, Item::ImportStart)));
+        let k = main
+            .iter()
+            .position(|i| matches!(i, Item::ChoiceMore(Setting::StartStyle, _, Page::StartMenu)))
+            .expect("Start menu row");
+        assert!(matches!(main[k - 1], Item::Choice(Setting::Language, _)));
+        assert!(matches!(main[k + 1], Item::Choice(Setting::Position, _)));
+        let page = items(&c, Page::StartMenu, false, &[]);
+        assert!(matches!(page.as_slice(), [Item::Back(_), Item::ImportStart]));
+    }
+
+    #[test]
+    fn start_menu_row_has_segments_and_a_separate_arrow() {
+        let m = crate::render::Metrics { dpi: 96 };
+        let s = Surface::new(m).expect("surface");
+        let mut p = SettingsPopup::at(Page::Main);
+        p.screens = Vec::new();
+        p.items = items(&p.cfg, Page::Main, false, &p.screens);
+        let (w, _) = p.size(&s);
+        let i = p.items.iter().position(|it| matches!(it, Item::ChoiceMore(..))).unwrap();
+        let n = options(Setting::StartStyle, &[]).len();
+        let last = p.hits.rect(item_id(i, Some(n - 1))).unwrap();
+        let arrow = p.hits.rect(item_id(i, Some(n))).unwrap();
+        // The arrow is right of the segments, apart from them, inside the popup.
+        assert!(arrow.left >= last.right && arrow.right <= w);
+        let (y, h) = p.rows[i];
+        assert!(arrow.top >= y && arrow.bottom <= y + h);
+        // Clicking the segments still chooses; the arrow opens the page, Back returns.
+        assert!(p.clickable(item_id(i, Some(n))));
+        assert_eq!(p.hits.at(arrow.left + 1, arrow.top + 1), Some(item_id(i, Some(n))));
+        assert_eq!(p.click(item_id(i, Some(n))), Reply::Relayout);
+        assert_eq!(p.page, Page::StartMenu);
+        assert!(matches!(p.items.as_slice(), [Item::Back(_), Item::ImportStart]));
+        p.size(&s);
+        assert_eq!(p.click(item_id(0, None)), Reply::Relayout);
+        assert_eq!(p.page, Page::Main);
+    }
+
+    #[test]
     fn hsv_roundtrip() {
         for (_, bg) in BACKGROUND_PRESETS {
             assert_eq!(background_of(rgb_to_hsv(bg.rgb())), bg);
@@ -1043,6 +1228,11 @@ mod tests {
             assert_eq!(background_of(rgb_to_hsv(bg.rgb())), bg);
         }
         assert_eq!(hsv_to_rgb(359.9, 1.0, 1.0).0, 255);
+    }
+
+    #[test]
+    fn every_preset_has_an_italian_name() {
+        assert_eq!(BACKGROUND_PRESETS.len(), 7, "update the Italian names in preset_name");
     }
 
     #[test]

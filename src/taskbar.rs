@@ -28,7 +28,8 @@ use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, FindWindowExW, GetClassNameW, GetParent, GetPropW, GetWindowThreadProcessId,
     IsWindowVisible, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW, SendNotifyMessageW,
-    SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, HWND_BOTTOM,
+    SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
+    HWND_BOTTOM,
     HWND_BROADCAST, HWND_NOTOPMOST, HWND_TOPMOST, MSGFLT_ALLOW, OBJID_WINDOW, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT,
     SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_COPYDATA,
@@ -52,6 +53,12 @@ static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 static WINEVENT_HOOK: AtomicIsize = AtomicIsize::new(0);
 /// Instant (ms since process start, +1) of the last `TaskbarCreated` broadcast sent by us.
 static LAST_BROADCAST_MS: AtomicU64 = AtomicU64::new(0);
+/// Explorer's primary `Shell_TrayWnd` as last seen by `hide_all` (0 = unknown): its destruction means
+/// Explorer is going away (`explorer_gone`).
+static EXPLORER_TRAY: AtomicIsize = AtomicIsize::new(0);
+/// `now_ms()` when `explorer_gone` stopped our tray host (0 = not paused): it is started again once the
+/// new Explorer has registered its desktop (`on_reannounce_timer`).
+static HOST_PAUSED_AT: AtomicU64 = AtomicU64::new(0);
 /// Monotonic time reference of the process.
 static START: OnceLock<Instant> = OnceLock::new();
 
@@ -64,6 +71,8 @@ const ABS_MASK: u32 = ABS_AUTOHIDE | ABS_ALWAYSONTOP;
 
 /// Quiet window during which our own `TaskbarCreated` broadcast is ignored.
 const OWN_BROADCAST_WINDOW_MS: u64 = 2000;
+/// Longest wait for a restarted Explorer's desktop before our tray host is started again anyway (ms).
+const HOST_RESUME_MAX_MS: u64 = 60_000;
 /// Maximum wait for `Shell_TrayWnd` at startup.
 const WAIT_TRAY_MS: u64 = 30_000;
 
@@ -229,6 +238,12 @@ fn appbar(msg: u32, hwnd: HWND, lparam: u32) -> usize {
         return v;
     }
     log!("taskbar: direct AppBar {msg} send failed, falling back to SHAppBarMessage");
+    appbar_shell(msg, hwnd, lparam)
+}
+
+/// AppBar message through `SHAppBarMessage` (tray host -> Explorer): the fallback of `appbar()`
+/// and `set_state()` when the direct send fails. Returns the raw value.
+fn appbar_shell(msg: u32, hwnd: HWND, lparam: u32) -> usize {
     let mut d = APPBARDATA {
         cbSize: std::mem::size_of::<APPBARDATA>() as u32,
         hWnd: hwnd,
@@ -252,14 +267,7 @@ fn set_state(tray: HWND, state: u32) -> bool {
         return true;
     }
     log!("taskbar: direct ABM_SETSTATE send failed, falling back to SHAppBarMessage");
-    let mut d = APPBARDATA {
-        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-        hWnd: tray,
-        lParam: LPARAM(state as isize),
-        ..Default::default()
-    };
-    // SAFETY: `d` is initialized with the correct `cbSize` and stays valid for the whole call.
-    unsafe { SHAppBarMessage(ABM_SETSTATE, &mut d) };
+    appbar_shell(ABM_SETSTATE, tray, state);
     matches!(appbar_direct(ABM_GETSTATE, tray, 0), Some(v) if (v as u32) & ABS_MASK == state)
 }
 
@@ -530,12 +538,18 @@ unsafe extern "system" fn winevent_proc(
     if hwnd.0.is_null() || id_object != OBJID_WINDOW.0 {
         return;
     }
-    if event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_CREATE {
+    if event == EVENT_OBJECT_DESTROY {
+        if hwnd.0 as isize != EXPLORER_TRAY.load(Relaxed) {
+            return;
+        }
+    } else if event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_CREATE {
         return;
     }
     // SAFETY: GetParent has no preconditions; for invalid windows it fails.
     let parent = unsafe { GetParent(hwnd) }.ok();
-    let hit = is_taskbar_class(&class_of(hwnd)) || parent.is_some_and(|p| is_taskbar_class(&class_of(p)));
+    let hit = event == EVENT_OBJECT_DESTROY
+        || is_taskbar_class(&class_of(hwnd))
+        || parent.is_some_and(|p| is_taskbar_class(&class_of(p)));
     if !hit {
         return;
     }
@@ -559,6 +573,9 @@ pub fn hide_all() {
     let list = native_taskbars();
     let Some(&first) = list.first() else { return };
     HIDDEN.store(true, Relaxed);
+    if class_of(first) == "Shell_TrayWnd" {
+        EXPLORER_TRAY.store(first.0 as isize, Relaxed);
+    }
     for &h in &list {
         if RESTORING.load(Relaxed) {
             return;
@@ -596,12 +613,24 @@ pub fn hide_all() {
 }
 
 /// Callback for `WM_DOCK_TASKBAR_EVENT` (wParam = event, lParam = HWND): if `hwnd` (or its parent)
-/// is of a native taskbar class and visible, redoes `hide_all()`.
+/// is of a native taskbar class and visible, redoes `hide_all()`. The creation of Explorer's primary
+/// `Shell_TrayWnd` is an Explorer restart (`explorer_restarted`).
 pub fn on_winevent(event: u32, hwnd: HWND) {
     if !HIDDEN.load(Relaxed) || hwnd.0.is_null() || restored_externally() {
         return;
     }
-    let target = if is_taskbar_class(&class_of(hwnd)) {
+    if event == EVENT_OBJECT_DESTROY {
+        if hwnd.0 as isize == EXPLORER_TRAY.swap(0, Relaxed) {
+            explorer_gone();
+        }
+        return;
+    }
+    let class = class_of(hwnd);
+    if event == EVENT_OBJECT_CREATE && class == "Shell_TrayWnd" && !is_dock_tray_host(hwnd) {
+        explorer_restarted("new Shell_TrayWnd");
+        return;
+    }
+    let target = if is_taskbar_class(&class) {
         hwnd
     } else {
         // SAFETY: GetParent has no preconditions; for invalid windows it fails.
@@ -641,7 +670,41 @@ pub fn on_taskbar_created() {
     if last != 0 && now_ms().saturating_sub(last) < OWN_BROADCAST_WINDOW_MS {
         return;
     }
-    log!("taskbar: TaskbarCreated (Explorer restarted?), redoing self-heal and hide");
+    explorer_restarted("TaskbarCreated");
+}
+
+/// Explorer's taskbar was destroyed (Explorer exited or crashed). Our tray host is a `Shell_TrayWnd` too:
+/// if it exists while the new Explorer starts, Explorer never registers its desktop with ShellWindows
+/// (every de-elevated launch then fails) nor broadcasts `TaskbarCreated`. So the host is stopped now
+/// and started again by `on_reannounce_timer` once the new desktop is registered.
+fn explorer_gone() {
+    if !crate::tray_host::is_started() {
+        return;
+    }
+    log!("taskbar: Explorer's taskbar destroyed, stopping our tray host until Explorer is back");
+    let hook = crate::popup::suspend_mouse_hook();
+    crate::tray_host::stop();
+    crate::popup::resume_mouse_hook(hook);
+    HOST_PAUSED_AT.store(now_ms(), Relaxed);
+    arm_reannounce(1000);
+}
+
+/// (Re)arms the one-shot `TIMER_TRAY_REANNOUNCE` on the dock window.
+fn arm_reannounce(ms: u32) {
+    let ui = crate::hwnd();
+    if !ui.0.is_null() {
+        // SAFETY: `ui` is the dock window, created by this thread (UI thread).
+        if unsafe { SetTimer(Some(ui), TIMER_TRAY_REANNOUNCE, ms, None) } == 0 {
+            log!("taskbar: SetTimer(TIMER_TRAY_REANNOUNCE) failed: {:?}", windows::core::Error::from_thread());
+        }
+    }
+}
+
+/// Explorer restarted: self-heal, hide, and announce our tray again. Reached from `TaskbarCreated` and
+/// from the creation of a new `Shell_TrayWnd` (`on_winevent`): while our tray host exists Explorer
+/// does not broadcast `TaskbarCreated` on restart, so the window event is what actually fires.
+fn explorer_restarted(why: &str) {
+    log!("taskbar: Explorer restarted ({why}), redoing self-heal and hide");
     self_heal();
     if !ensure_state_saved(None) {
         log!("taskbar: state not saveable after the Explorer restart, not hiding");
@@ -649,16 +712,13 @@ pub fn on_taskbar_created() {
         return;
     }
     hide_all();
+    if HOST_PAUSED_AT.load(Relaxed) != 0 {
+        return; // our host comes back (and is announced) once the new desktop is registered
+    }
     // Explorer's new Shell_TrayWnd is born topmost and would sit in front of ours: it is brought back to the
     // top and, after 300 ms, announced again so apps re-register their icons with us.
     crate::tray_host::raise();
-    let ui = crate::hwnd();
-    if !ui.0.is_null() {
-        // SAFETY: `ui` is the dock window, created by this thread (UI thread).
-        if unsafe { SetTimer(Some(ui), TIMER_TRAY_REANNOUNCE, 300, None) } == 0 {
-            log!("taskbar: SetTimer(TIMER_TRAY_REANNOUNCE) failed: {:?}", windows::core::Error::from_thread());
-        }
-    }
+    arm_reannounce(300);
 }
 
 /// "Normal" restore by the dock on exit (WM_DESTROY/clean exit, WM_ENDSESSION wParam != 0,
@@ -737,14 +797,7 @@ pub fn restore_force() {
             }
         }
     }
-    let msg = ensure_taskbar_created_msg();
-    if msg != 0 {
-        LAST_BROADCAST_MS.store(now_ms(), Relaxed);
-        // SAFETY: non-blocking broadcast (SendNotifyMessage); no pointers in the parameters.
-        if let Err(e) = unsafe { SendNotifyMessageW(HWND_BROADCAST, msg, WPARAM(0), LPARAM(0)) } {
-            log!("taskbar: TaskbarCreated broadcast failed: {e}");
-        }
-    }
+    broadcast_taskbar_created();
     log!("taskbar: restored (state {state})");
 }
 
@@ -779,22 +832,52 @@ pub fn is_dock_tray_host(h: HWND) -> bool {
 /// host) and our `on_taskbar_created` ignores the broadcast. Called by `main` after a successful
 /// `tray_host::start` and by `on_reannounce_timer`.
 pub fn announce_tray() {
+    if broadcast_taskbar_created() {
+        log!("taskbar: tray announced (TaskbarCreated)");
+    }
+}
+
+/// `LAST_BROADCAST_MS = now` + non-blocking `SendNotifyMessageW(HWND_BROADCAST, TaskbarCreated)`,
+/// shared by `restore_force` and `announce_tray`. true if the broadcast was sent; failures are logged.
+fn broadcast_taskbar_created() -> bool {
     let msg = ensure_taskbar_created_msg();
     if msg == 0 {
-        return;
+        return false;
     }
     LAST_BROADCAST_MS.store(now_ms(), Relaxed);
     // SAFETY: non-blocking broadcast (SendNotifyMessage); no pointers in the parameters.
     if let Err(e) = unsafe { SendNotifyMessageW(HWND_BROADCAST, msg, WPARAM(0), LPARAM(0)) } {
-        log!("taskbar: TaskbarCreated broadcast (tray announcement) failed: {e}");
-    } else {
-        log!("taskbar: tray announced (TaskbarCreated)");
+        log!("taskbar: TaskbarCreated broadcast failed: {e}");
+        return false;
     }
+    true
 }
 
 /// `TIMER_TRAY_REANNOUNCE` (one-shot, already killed by `main`): second announcement after an Explorer
 /// restart, if the taskbar is still hidden and the tray host is active.
 pub fn on_reannounce_timer() {
+    let paused = HOST_PAUSED_AT.load(Relaxed);
+    if paused != 0 {
+        // Waiting for the new Explorer: its desktop first, then our host (`HOST_RESUME_MAX_MS` at most).
+        let waited = now_ms().saturating_sub(paused);
+        if !crate::shell_thread::desktop_registered() && waited < HOST_RESUME_MAX_MS {
+            arm_reannounce(1000);
+            return;
+        }
+        HOST_PAUSED_AT.store(0, Relaxed);
+        if !HIDDEN.load(Relaxed) {
+            return;
+        }
+        log!("taskbar: Explorer back after {waited} ms, starting our tray host again");
+        let hook = crate::popup::suspend_mouse_hook();
+        let started = crate::tray_host::start(crate::hwnd());
+        crate::popup::resume_mouse_hook(hook);
+        match started {
+            Ok(()) => announce_tray(),
+            Err(e) => log!("taskbar: tray host not restarted (icons stay in Explorer's tray): {e}"),
+        }
+        return;
+    }
     if HIDDEN.load(Relaxed) && crate::tray_host::is_running() {
         announce_tray();
     }

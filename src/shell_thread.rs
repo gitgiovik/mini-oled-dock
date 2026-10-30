@@ -34,8 +34,9 @@ use windows::Win32::Graphics::Gdi::HGDIOBJ;
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, WIN32_FIND_DATAW};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, IDispatch, IPersistFile,
-    IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
+    CoAllowSetForegroundWindow, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, IDispatch,
+    IPersistFile, IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
+    STGM_READ,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken};
 use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR, VT_I4};
@@ -56,15 +57,16 @@ use windows::Win32::UI::Shell::{
     CSIDL_DESKTOP, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, DispatchMessageW, GetClassLongPtrW, GetMessageW, KillTimer, PeekMessageW, PostMessageW,
-    PostThreadMessageW, SendMessageTimeoutW, SetTimer, TranslateMessage, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG,
-    ICON_SMALL2, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, WM_GETICON, WM_QUIT, WM_TIMER,
+    AllowSetForegroundWindow, DestroyIcon, DispatchMessageW, GetClassLongPtrW, GetMessageW, GetWindowThreadProcessId,
+    KillTimer, PeekMessageW, PostMessageW, PostThreadMessageW, SendMessageTimeoutW, SetTimer, TranslateMessage,
+    ASFW_ANY, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL2, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_SHOWNORMAL,
+    WM_GETICON, WM_QUIT, WM_TIMER,
 };
 
 use crate::audio::{self, AudioController};
 use crate::icons::{self, IconBitmap, MASTER_PX};
 use crate::log;
-use crate::msg::{WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_WAKE};
+use crate::msg::{WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_SPATIAL_CHANGED, WM_SHELL_WAKE};
 
 // ------------------------------------------------------------------ public types
 
@@ -155,6 +157,18 @@ pub enum ShellRequest {
     /// make `id` the default output device (IPolicyConfig), then republish
     /// `ShellEvent::AudioOutputs` and the volume. On failure: log + `Launch("ms-settings:sound")`.
     SetDefaultOutput { id: String },
+    /// Audio popup: read the spatial sound formats of the default output -> `ShellEvent::Spatial`.
+    ListSpatial,
+    /// Audio popup: make `subtype` (empty = Off) the default spatial format. Runs on a short-lived
+    /// thread; when it ends `ShellEvent::Spatial` is pushed again (if the popup is still open).
+    SetSpatialFormat { subtype: String },
+    /// Audio popup: enumerate the per-app sessions of the default output -> `ShellEvent::AudioSessions`.
+    ListSessions,
+    /// Audio popup: set the level (0..=100) of all the sessions of one mixer row. No reply (the
+    /// popup asks `ListSessions` when the drag ends).
+    SetSessionVolume { pid: u32, system: bool, level: u8 },
+    /// Audio popup: toggle the mute of all the sessions of one mixer row -> `ShellEvent::AudioSessions`.
+    ToggleSessionMute { pid: u32, system: bool },
     /// "Show desktop" (`IShellDispatch4::ToggleDesktop`, fallback Win+D with `INJECT_TAG`).
     ToggleDesktop,
     /// "Start" button: synthetic Win press and release with `INJECT_TAG` (opens / closes the Start menu).
@@ -189,6 +203,12 @@ pub enum ShellEvent {
     /// active output devices (reply to `ListOutputs`/`SetDefaultOutput`, and
     /// spontaneously after `WM_SHELL_AUDIO_DEVICE_CHANGED`). Empty = none / error.
     AudioOutputs(Vec<audio::OutputDevice>),
+    /// Spatial sound state of the default output (`None` = not supported). Reply to `ListSpatial`,
+    /// and pushed after a format change or a device change while the audio popup is open.
+    Spatial(Option<audio::SpatialState>),
+    /// Per-app mixer rows of the default output (reply to `ListSessions` / `ToggleSessionMute`, and
+    /// after a device change while the audio popup is open).
+    AudioSessions(Vec<audio::AppSession>),
     /// Status of the active network connection (reply to `NetworkQuery`).
     Network(crate::net::NetInfo),
     /// The AppsFolder catalog (reply to `ListStartApps`), in enumeration order.
@@ -373,6 +393,11 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
             WM_SHELL_WAKE => {}
             WM_TIMER if msg.hwnd.0.is_null() => {}
             WM_SHELL_AUDIO_DEVICE_CHANGED => shell.on_audio_device_changed(),
+            WM_SHELL_SPATIAL_CHANGED => {
+                if audio::popup_wants_spatial() {
+                    shell.push_spatial();
+                }
+            }
             _ => {
                 // SAFETY: `msg` was just filled by GetMessageW; needed by COM STA for its internal messages.
                 unsafe {
@@ -422,8 +447,42 @@ impl Shell {
         self.ensure_audio();
         let st = self.audio.as_mut().map(|a| a.reopen_endpoint());
         self.publish_volume(st);
-        let list = self.audio.as_ref().map(|a| a.list_outputs()).unwrap_or_default();
-        push_event(self.ui, ShellEvent::AudioOutputs(list));
+        // The device list, the spatial formats and the sessions belong to the default device:
+        // re-read each one only while the audio popup shows it (open popup, section expanded and
+        // visible: `audio::set_popup_wants`). A collapsed section enumerates nothing.
+        if audio::popup_wants_outputs() {
+            let list = self.audio.as_ref().map(|a| a.list_outputs()).unwrap_or_default();
+            push_event(self.ui, ShellEvent::AudioOutputs(list));
+        }
+        if audio::popup_wants_spatial() {
+            self.push_spatial();
+        }
+        if audio::popup_wants_sessions() {
+            self.push_sessions();
+        }
+    }
+
+    /// Reads the spatial sound state now (nothing kept) and pushes it to the UI.
+    fn push_spatial(&mut self) {
+        self.ensure_audio();
+        let st = self.audio.as_ref().and_then(|a| a.spatial());
+        push_event(self.ui, ShellEvent::Spatial(st));
+    }
+
+    /// Enumerates the per-app sessions now (no COM object kept), resolves the row names and pushes
+    /// them to the UI.
+    fn push_sessions(&mut self) {
+        self.ensure_audio();
+        let raw = self.audio.as_ref().map(|a| a.list_sessions()).unwrap_or_default();
+        let mut rows = audio::group_sessions(&raw);
+        for r in rows.iter_mut() {
+            if r.system {
+                r.name = crate::i18n::tr("System sounds", "Suoni di sistema").to_string();
+            } else if r.name.is_empty() {
+                r.name = session_app_name(r.pid);
+            }
+        }
+        push_event(self.ui, ShellEvent::AudioSessions(rows));
     }
 
     /// Drains the mpsc queue and works through the requests: volume/launch first, then the (slow)
@@ -487,6 +546,28 @@ impl Shell {
                 }
                 let list = self.audio.as_ref().map(|a| a.list_outputs()).unwrap_or_default();
                 push_event(self.ui, ShellEvent::AudioOutputs(list));
+            }
+            ShellRequest::ListSpatial => self.push_spatial(),
+            ShellRequest::SetSpatialFormat { subtype } => {
+                self.ensure_audio();
+                match self.audio.as_ref().and_then(|a| a.default_winrt_id()) {
+                    Some(id) => audio::spawn_set_spatial(id, subtype),
+                    None => log!("shell: SetSpatialFormat: no default output device"),
+                }
+            }
+            ShellRequest::ListSessions => self.push_sessions(),
+            ShellRequest::SetSessionVolume { pid, system, level } => {
+                self.ensure_audio();
+                if let Some(a) = self.audio.as_ref() {
+                    a.set_session_volume(pid, system, level);
+                }
+            }
+            ShellRequest::ToggleSessionMute { pid, system } => {
+                self.ensure_audio();
+                if let Some(a) = self.audio.as_ref() {
+                    a.toggle_session_mute(pid, system);
+                }
+                self.push_sessions();
             }
             ShellRequest::ToggleDesktop => toggle_desktop(),
             ShellRequest::OpenStart => send_win_alone(),
@@ -673,6 +754,22 @@ fn natural_name(r: &ResolveApp) -> (String, &'static str) {
         }
     }
     (r.key.clone(), "key")
+}
+
+/// Name of a mixer row without a usable session display name: the exe FileDescription (generic
+/// tails stripped), else the prettified exe stem, else "PID n". Nothing is cached.
+fn session_app_name(pid: u32) -> String {
+    let Some(path) = crate::apps::exe_path_of_pid(pid) else { return format!("PID {pid}") };
+    if let Some(d) = FileInfo::read(&path).description.as_deref().map(strip_generic).filter(|d| !d.is_empty()) {
+        return d;
+    }
+    let stem = Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let pretty = pretty_stem(&stem);
+    if pretty.is_empty() {
+        format!("PID {pid}")
+    } else {
+        pretty
+    }
 }
 
 /// True for executables under `%SystemRoot%`.
@@ -933,7 +1030,8 @@ fn build_start_index() -> HashMap<String, String> {
     map
 }
 
-fn expand_env(s: &str) -> String {
+/// `%NAME%` variables of the process environment expanded; unknown ones are kept as written.
+pub(crate) fn expand_env(s: &str) -> String {
     let mut out = String::new();
     let mut parts = s.split('%');
     out.push_str(parts.next().unwrap_or(""));
@@ -1042,8 +1140,9 @@ fn keep_start_app(id: &str, name: &str) -> bool {
 
 /// Every app of `shell:AppsFolder` (desktop shortcuts of the Start Menu folders AND packaged Store
 /// apps, the same catalog as the native Start menu): `IShellItem::BindToHandler(BHID_EnumItems)`.
-/// Duplicate ids are dropped. Empty on any failure (logged).
-fn enum_apps_folder() -> Vec<StartApp> {
+/// Duplicate ids are dropped. Empty on any failure (logged). Needs COM on the calling thread (the
+/// shell thread, or the short-lived import job of `start_import`).
+pub(crate) fn enum_apps_folder() -> Vec<StartApp> {
     let path = HSTRING::from("shell:AppsFolder");
     // SAFETY: COM STA initialized on the shell thread; `path` lives for the call.
     let folder: IShellItem = match unsafe { SHCreateItemFromParsingName(&path, None::<&IBindCtx>) } {
@@ -1144,16 +1243,17 @@ fn start_icon(id: &str, px: u32) -> Option<IconBitmap> {
     nonempty(icons::resize_area(&b?, px))
 }
 
-/// Version-resource strings of an executable, read through `IShellItem2::GetString`.
+/// Version-resource strings of an executable, read through `IShellItem2::GetString`. Also used by
+/// `tray_host` for the tray icons' app names. Needs COM initialized on the calling thread.
 #[derive(Default)]
-struct FileInfo {
-    description: Option<String>,
+pub(crate) struct FileInfo {
+    pub(crate) description: Option<String>,
     product: Option<String>,
     company: Option<String>,
 }
 
 impl FileInfo {
-    fn read(exe_path: &str) -> FileInfo {
+    pub(crate) fn read(exe_path: &str) -> FileInfo {
         let path = HSTRING::from(exe_path);
         // SAFETY: COM STA initialized; `path` lives for the call.
         let Ok(item) = (unsafe { SHCreateItemFromParsingName::<_, _, IShellItem2>(&path, None::<&IBindCtx>) }) else {
@@ -1454,12 +1554,30 @@ impl Drop for OwnedVariant {
     }
 }
 
+/// true if Explorer's desktop is registered with `ShellWindows`, i.e. `desktop_shell_execute` can
+/// reach it. A freshly (re)started Explorer registers it some seconds after its taskbar appears.
+/// Needs COM initialized on the calling thread.
+pub(crate) fn desktop_registered() -> bool {
+    // SAFETY: COM initialized by the caller; the interface is released when it goes out of scope and
+    // the VARIANTs outlive the call.
+    unsafe {
+        let Ok(windows) = CoCreateInstance::<_, IShellWindows>(&ShellWindows, None, CLSCTX_LOCAL_SERVER) else {
+            return false;
+        };
+        let loc = OwnedVariant::i4(CSIDL_DESKTOP as i32);
+        let root = OwnedVariant::empty();
+        let mut hwnd = 0i32;
+        windows.FindWindowSW(&loc.0, &root.0, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH).is_ok()
+    }
+}
+
 /// Runs `file` through the desktop shell (Explorer, at the user's medium integrity), so the new
 /// process is NOT elevated even when the dock is:
 /// `IShellWindows::FindWindowSW(CSIDL_DESKTOP)` -> `IServiceProvider::QueryService(SID_STopLevelBrowser)`
 /// -> `IShellBrowser::QueryActiveShellView` -> `IShellView::GetItemObject(SVGIO_BACKGROUND)`
 /// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., verb, SW_SHOWNORMAL)`.
 /// `verb` is `Open` for every launch except `launch_admin` (`RunAs`: Explorer asks UAC, not the dock).
+/// Before executing, grants foreground rights to Explorer so the launched app opens in the foreground.
 /// Must be called on a COM STA thread (the shell thread).
 fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> windows::core::Result<()> {
     // SAFETY: COM STA initialized on the shell thread; every interface below is used only on this
@@ -1476,6 +1594,16 @@ fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb
         let background: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
         let folder_view: IShellFolderViewDual = background.cast()?;
         let shell: IShellDispatch2 = folder_view.Application()?.cast()?;
+        // Foreground rights: the dock received the click, Explorer did not. Without this the
+        // de-elevated app (started by Explorer) opens behind the current foreground window.
+        // Grant them to Explorer (desktop window owner), which passes them on to the process it
+        // starts; ASFW_ANY as a fallback. Both expire at the next user input.
+        let mut explorer_pid = 0u32;
+        GetWindowThreadProcessId(HWND(hwnd as isize as *mut c_void), Some(&mut explorer_pid));
+        if explorer_pid == 0 || AllowSetForegroundWindow(explorer_pid).is_err() {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+        }
+        let _ = CoAllowSetForegroundWindow(&shell, None);
         shell.ShellExecute(
             &BSTR::from(file),
             &OwnedVariant::opt_bstr(args).0,
@@ -1496,33 +1624,8 @@ fn toggle_desktop() {
     let r = sd.and_then(|sd| unsafe { sd.ToggleDesktop() });
     if let Err(e) = r {
         log!("shell: ToggleDesktop COM failed: {e}, using Win+D");
-        send_win_d();
-    }
-}
-
-/// Win+D with `dwExtraInfo = INJECT_TAG` (the keyboard hook lets it through).
-fn send_win_d() {
-    let key = |vk: VIRTUAL_KEY, up: bool, ext: bool| {
-        let mut flags = KEYBD_EVENT_FLAGS(0);
-        if up {
-            flags |= KEYEVENTF_KEYUP;
-        }
-        if ext {
-            flags |= KEYEVENTF_EXTENDEDKEY;
-        }
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: crate::hook::INJECT_TAG },
-            },
-        }
-    };
-    let d = VIRTUAL_KEY(0x44);
-    let inputs = [key(VK_LWIN, false, true), key(d, false, false), key(d, true, false), key(VK_LWIN, true, true)];
-    // SAFETY: `inputs` is a valid array of INPUT with the declared size.
-    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if n as usize != inputs.len() {
-        log!("shell: SendInput Win+D: sent {n}/{}", inputs.len());
+        // Plain SendInput (no UI-thread state): safe to call from the shell thread.
+        crate::ui::send_win_key(VIRTUAL_KEY(0x44));
     }
 }
 

@@ -182,7 +182,7 @@ impl Content for TrayPopup {
             hline(s, inset + pad_text, self.width - inset - pad_text, self.sep_y);
         }
         if let Some(rc) = self.empty_rc {
-            let txt = "No tray apps";
+            let txt = crate::i18n::tr("No tray apps", "Nessuna app nell'area di notifica");
             let y = center_y(&rc, s.line_height(Font::Normal));
             s.text(txt, rc.left + pad_text, y, Font::Normal, WHITE, TEXT3_ALPHA);
         }
@@ -201,7 +201,7 @@ impl Content for TrayPopup {
                 let px = rc.right - m.px(12) - pw;
                 // On but ended up behind the chevron (bar full): the suffix says so.
                 let label =
-                    if row.visible && !row.in_bar { format!("{} · no room", row.name) } else { row.name.clone() };
+                    if row.visible && !row.in_bar { format!("{} · {}", row.name, crate::i18n::tr("no room", "spazio insufficiente")) } else { row.name.clone() };
                 let name = s.ellipsize(&label, Font::Normal, (px - m.px(10) - tx).max(0));
                 let a = lift(if row.visible { TEXT_ALPHA } else { TEXT2_ALPHA }, h);
                 let ty = center_y(&rc, s.line_height(Font::Normal));
@@ -211,7 +211,7 @@ impl Content for TrayPopup {
             if let Some(rc) = self.hits.rect(ID_DONE) {
                 let h = row_plate(s, rc, ID_DONE, hot, pressed);
                 let y = center_y(&rc, s.line_height(Font::Normal));
-                s.text("Done", rc.left + pad_text, y, Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+                s.text(crate::i18n::tr("Done", "Fine"), rc.left + pad_text, y, Font::Normal, WHITE, lift(TEXT_ALPHA, h));
             }
             return;
         }

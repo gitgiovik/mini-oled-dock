@@ -1,23 +1,83 @@
 //! POWER popup: Sleep, Lock, Restart, Shut down, separator, "Settings" (switches to the Settings
 //! popup, `popup_settings`), "Start with Windows" (toggle, scheduled task: `autostart`), "Exit dock". A click runs the action immediately: the menu itself guards against accidental clicks
 //! (user's choice, no confirmation). Actions in `power::run`.
+//!
+//! The items, labels, glyphs and the choice behind each one are shared (`pub(crate)` helpers below)
+//! with the power flyout of the horizontal Start menu (`popup_startmenu`), which offers the same
+//! entries except the autostart toggle.
 
 use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
 use std::sync::Arc;
 
 use crate::glyphs;
 use crate::log;
+use crate::i18n::tr;
 use crate::popup::{center_y, hline, lift, row_plate, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::power::{self, PowerAction};
 use crate::surface::{rect_wh, Font, Surface, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE};
 
-const ID_SLEEP: u32 = 1;
-const ID_LOCK: u32 = 2;
-const ID_RESTART: u32 = 3;
-const ID_SHUTDOWN: u32 = 4;
-const ID_EXIT: u32 = 5;
+pub(crate) const ID_SLEEP: u32 = 1;
+pub(crate) const ID_LOCK: u32 = 2;
+pub(crate) const ID_RESTART: u32 = 3;
+pub(crate) const ID_SHUTDOWN: u32 = 4;
+pub(crate) const ID_EXIT: u32 = 5;
 const ID_AUTOSTART: u32 = 6;
-const ID_SETTINGS: u32 = 7;
+pub(crate) const ID_SETTINGS: u32 = 7;
+
+/// Items above the separator (the system actions), in menu order.
+pub(crate) const SYSTEM_ITEMS: [u32; 4] = [ID_SLEEP, ID_LOCK, ID_RESTART, ID_SHUTDOWN];
+/// Items of the Start menu's power flyout below the separator (no autostart toggle there: its state
+/// needs a schtasks query on open).
+pub(crate) const DOCK_ITEMS: [u32; 2] = [ID_SETTINGS, ID_EXIT];
+
+/// What choosing a power item does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Choice {
+    /// Run the action after the popup closes (`power::run`).
+    Run(PowerAction),
+    /// Switch to the Settings popup.
+    Settings,
+}
+
+/// The choice behind item `id` (`None` for the autostart toggle and unknown ids).
+pub(crate) fn choice(id: u32) -> Option<Choice> {
+    Some(match id {
+        ID_SLEEP => Choice::Run(PowerAction::Sleep),
+        ID_LOCK => Choice::Run(PowerAction::Lock),
+        ID_RESTART => Choice::Run(PowerAction::Restart),
+        ID_SHUTDOWN => Choice::Run(PowerAction::Shutdown),
+        ID_EXIT => Choice::Run(PowerAction::ExitDock),
+        ID_SETTINGS => Choice::Settings,
+        _ => return None,
+    })
+}
+
+/// Glyph of item `id` (16x16 space).
+pub(crate) fn shape(id: u32) -> fn(f32, f32) -> bool {
+    match id {
+        ID_SLEEP => glyphs::moon_shape,
+        ID_LOCK => glyphs::lock_shape,
+        ID_RESTART => glyphs::restart_shape,
+        ID_SHUTDOWN => glyphs::power_shape,
+        ID_SETTINGS => glyphs::gear_shape,
+        ID_AUTOSTART => glyphs::startup_shape,
+        _ => glyphs::exit_shape,
+    }
+}
+
+/// Base text alpha of item `id` ("Exit dock" is dimmer).
+pub(crate) fn alpha(id: u32) -> u32 {
+    if id == ID_EXIT {
+        TEXT2_ALPHA
+    } else {
+        TEXT_ALPHA
+    }
+}
+
+/// Runs a power action (after the popup that offered it has closed).
+pub(crate) fn run(a: PowerAction) {
+    power::run(a);
+}
 
 /// State of the "Start with Windows" toggle (shared with the threads that query/modify the task).
 const AS_UNKNOWN: u8 = 0;
@@ -62,15 +122,16 @@ pub(crate) fn new() -> Box<dyn Content> {
     })
 }
 
-fn label(id: u32) -> &'static str {
+/// Label of item `id` in the dock language.
+pub(crate) fn label(id: u32) -> &'static str {
     match id {
-        ID_SLEEP => "Sleep",
-        ID_LOCK => "Lock",
-        ID_RESTART => "Restart",
-        ID_SHUTDOWN => "Shut down",
-        ID_AUTOSTART => "Start with Windows",
-        ID_SETTINGS => "Settings",
-        _ => "Exit dock",
+        ID_SLEEP => tr("Sleep", "Sospendi"),
+        ID_LOCK => tr("Lock", "Blocca"),
+        ID_RESTART => tr("Restart", "Riavvia"),
+        ID_SHUTDOWN => tr("Shut down", "Arresta il sistema"),
+        ID_AUTOSTART => tr("Start with Windows", "Avvia con Windows"),
+        ID_SETTINGS => tr("Settings", "Impostazioni"),
+        _ => tr("Exit dock", "Esci dal dock"),
     }
 }
 
@@ -87,7 +148,7 @@ impl Content for PowerPopup {
         self.pad_text = m.px(12);
         self.hits.clear();
         let mut y = inset;
-        for id in [ID_SLEEP, ID_LOCK, ID_RESTART, ID_SHUTDOWN] {
+        for id in SYSTEM_ITEMS {
             self.hits.add(id, rect_wh(inset, y, w - 2 * inset, row));
             y += row;
         }
@@ -109,21 +170,13 @@ impl Content for PowerPopup {
         for id in [ID_SLEEP, ID_LOCK, ID_RESTART, ID_SHUTDOWN, ID_SETTINGS, ID_AUTOSTART, ID_EXIT] {
             let Some(rc) = self.hits.rect(id) else { continue };
             let h = row_plate(s, rc, id, hot, pressed);
-            let (txt, alpha) = if id == ID_EXIT { (label(id), TEXT2_ALPHA) } else { (label(id), TEXT_ALPHA) };
+            let (txt, alpha) = (label(id), alpha(id));
             let font = Font::Normal;
             let y = center_y(&rc, s.line_height(font));
             // Icon in a 16 px slot at the text column, label after it (same alignment as the audio devices).
             let m = s.metrics();
             let icon = m.px(16);
-            let shape: fn(f32, f32) -> bool = match id {
-                ID_SLEEP => glyphs::moon_shape,
-                ID_LOCK => glyphs::lock_shape,
-                ID_RESTART => glyphs::restart_shape,
-                ID_SHUTDOWN => glyphs::power_shape,
-                ID_SETTINGS => glyphs::gear_shape,
-                ID_AUTOSTART => glyphs::startup_shape,
-                _ => glyphs::exit_shape,
-            };
+            let shape = shape(id);
             s.glyph(rc.left + self.pad_text, rc.top + ((rc.bottom - rc.top) - icon) / 2, icon, lift(alpha, h), &shape);
             s.text(txt, rc.left + self.pad_text + icon + m.px(8), y, font, WHITE, lift(alpha, h));
             if id == ID_SETTINGS {
@@ -160,22 +213,19 @@ impl Content for PowerPopup {
         if id == ID_AUTOSTART {
             return self.toggle_autostart();
         }
-        if id == ID_SETTINGS {
-            return Reply::Switch(PopupKind::Settings);
+        match choice(id) {
+            Some(Choice::Settings) => Reply::Switch(PopupKind::Settings),
+            Some(Choice::Run(a)) => {
+                self.pending = Some(a);
+                Reply::Close
+            }
+            None => Reply::None,
         }
-        self.pending = Some(match id {
-            ID_SLEEP => PowerAction::Sleep,
-            ID_LOCK => PowerAction::Lock,
-            ID_RESTART => PowerAction::Restart,
-            ID_SHUTDOWN => PowerAction::Shutdown,
-            _ => PowerAction::ExitDock,
-        });
-        Reply::Close
     }
 
     fn after_close(&mut self) {
         if let Some(a) = self.pending.take() {
-            power::run(a);
+            run(a);
         }
     }
 }

@@ -123,6 +123,11 @@ const TIMER_WIDTH: usize = 40;
 /// After a popup closes, a foreground change to the fullscreen app within this
 /// time (ms) is the automatic focus return and does not hide the dock.
 const POPUP_CLOSE_GRACE_MS: u64 = 400;
+/// Right after the dock/popup take the foreground over a fullscreen app, a foreground change back
+/// to that app within this time (ms) is the app bouncing it back (or a stale event), not the user.
+const FS_BOUNCE_GRACE_MS: u64 = 800;
+/// How many times the foreground is re-taken after such a bounce, per show of the dock.
+const FS_MAX_RETAKES: u32 = 2;
 /// Duration of the width animation (ms, out-cubic).
 const WIDTH_ANIM_MS: u64 = 160;
 /// Timer of the attention blink (local id).
@@ -167,6 +172,10 @@ static EDGE_ARMED: AtomicBool = AtomicBool::new(true);
 static FS_SHOWN: AtomicBool = AtomicBool::new(false);
 /// HWND (as isize) of the fullscreen app under the dock, to give it the foreground back.
 static FS_PREV: AtomicIsize = AtomicIsize::new(0);
+/// Tick (ms) of the last `force_foreground` call (0 = never).
+static FG_TAKEN_AT: AtomicU64 = AtomicU64::new(0);
+/// Foreground re-takes after a fullscreen bounce since the dock was shown.
+static FS_RETAKES: AtomicU32 = AtomicU32::new(0);
 /// Previous state of the left/right mouse buttons (falling-edge detection).
 static CLICK_DOWN: AtomicBool = AtomicBool::new(false);
 /// Id of the registered "SHELLHOOK" window message (0 = not registered).
@@ -593,19 +602,73 @@ pub fn toggle() {
     }
 }
 
+/// Lone Win tap (`WM_DOCK_TOGGLE`). With `config.win_opens_start` it opens / closes the Start menu
+/// together with the bar (`start_with_bar`), otherwise it shows / hides the bar (`toggle`).
+pub fn win_tap() {
+    if config::get().win_opens_start {
+        start_with_bar();
+    } else {
+        toggle();
+    }
+}
+
+/// Second quick Win tap (`WM_DOCK_START_MENU`). With `config.win_opens_start` every tap is the same
+/// toggle (`start_with_bar`), otherwise it opens the Start menu (`open_start_menu`).
+pub fn win_double_tap() {
+    if config::get().win_opens_start {
+        start_with_bar();
+    } else {
+        open_start_menu();
+    }
+}
+
+/// `win_opens_start`: the Start menu and the bar appear and disappear as ONE animation. A hidden bar
+/// is shown and the Start menu is linked to its slide+fade (`popup::link_to_bar`: same level, same
+/// frame, presented from `on_vis_tick`); with the Start menu open, the bar hides and the menu is linked
+/// to the hide animation, then closes on its last frame. A tap during that hide reverses both. With
+/// auto-hide off the bar stays and only the Start menu closes.
+fn start_with_bar() {
+    if popup::current() == Some(PopupKind::StartMenu) {
+        if !VISIBLE.load(Relaxed) && popup::is_linked() {
+            show_dock("Win (Start + bar, reversed)", SHOW_MS);
+        } else if VISIBLE.load(Relaxed) && config::effective_autohide() {
+            popup::link_to_bar();
+            hide_dock("Win (Start + bar)");
+        } else {
+            popup::close("Win (Start)");
+        }
+        return;
+    }
+    toggle_start_menu("Win (Start + bar)");
+}
+
+/// Toggles the dock's Start menu on the bar, which in "pointer" mode is first brought to the display
+/// under the pointer. A hidden bar is shown and an opening menu is linked to its slide+fade.
+fn toggle_start_menu(reason: &str) {
+    follow_pointer();
+    let was_visible = VISIBLE.load(Relaxed);
+    if !was_visible {
+        show_dock(reason, SHOW_MS);
+    }
+    match anchor_for(ItemId::Start).or_else(bar_start_anchor) {
+        Some(a) => popup::toggle(PopupKind::StartMenu, a),
+        None => {
+            log!("toggle_start_menu: the bar has no geometry yet");
+            return;
+        }
+    }
+    if !was_visible && popup::current() == Some(PopupKind::StartMenu) && popup::link_to_bar() {
+        let (dy, alpha) = vis_offset(config_top());
+        popup::follow_bar(dy, alpha, false);
+    }
+}
+
 /// Win key tapped twice (`WM_DOCK_START_MENU`): opens (or closes) the dock's own Start menu
 /// (`popup_startmenu`: all apps, search, pins) on the bar, which in "pointer" mode is first brought
 /// to the display under the pointer. The first tap already toggled the bar, so it is shown again if
 /// that tap hid it.
 pub fn open_start_menu() {
-    follow_pointer();
-    if !VISIBLE.load(Relaxed) {
-        show_dock("Win double tap (Start menu)", SHOW_MS);
-    }
-    match anchor_for(ItemId::Start).or_else(bar_start_anchor) {
-        Some(a) => popup::toggle(PopupKind::StartMenu, a),
-        None => log!("open_start_menu: the bar has no geometry yet"),
-    }
+    toggle_start_menu("Win double tap (Start menu)");
 }
 
 /// Anchor at the left end of the bar, for the Start popup when the Start button is hidden.
@@ -640,7 +703,8 @@ fn pointer_hmonitor() -> HMONITOR {
 }
 
 /// "pointer" mode: brings the bar to the display under the pointer (metrics, fonts, icons and
-/// geometry follow that display's DPI). Returns true if the bar changed display.
+/// geometry follow that display's DPI). Returns true if the bar changed display; a bar visible on the
+/// old display is hidden at once there, so the caller's `show_dock` slides it in on the new one.
 fn follow_pointer() -> bool {
     if !follows_pointer() {
         return false;
@@ -653,6 +717,9 @@ fn follow_pointer() -> bool {
     // A popup or the picker anchored to the old position would be left behind.
     popup::close("bar moved to the pointer display");
     picker_cancel("bar moved to the pointer display");
+    if VISIBLE.load(Relaxed) {
+        hide("bar moved to the pointer display", true);
+    }
     apply_dpi(dock_dpi());
     true
 }
@@ -1110,6 +1177,10 @@ fn on_vis_tick(h: HWND) {
     if done {
         stop_vis_anim(a.to);
         if a.to <= 0.0 {
+            // A popup linked to the hide (Win with the Start menu open) goes away on the same frame.
+            if popup::is_linked() {
+                popup::close("bar hidden (with Start)");
+            }
             hide_window(h);
             return;
         }
@@ -1117,6 +1188,8 @@ fn on_vis_tick(h: HWND) {
     let Some(g) = GEOM.with(|g| g.get()) else { return };
     let (dy, alpha) = vis_offset(config_top());
     render::present_alpha(h, g.x, g.y + dy, alpha);
+    // Same level, same tick: a linked popup moves with the bar (released once the show settles).
+    popup::follow_bar(dy, alpha, done);
 }
 
 // ------------------------------------------------------------ attention (FlashWindowEx)
@@ -1182,7 +1255,7 @@ fn on_attn_tick(h: HWND) {
     }
 }
 
-/// Destroys the UI resources (`render::destroy`, `apps::remove_winevent_hook`). In `cleanup`.
+/// Destroys the UI resources (`render::destroy`; `main::cleanup` removes the apps WinEventHook).
 pub fn shutdown() {
     kill_timer(hwnd(), TIMER_ANIM);
     kill_timer(hwnd(), TIMER_VIS);
@@ -1191,7 +1264,6 @@ pub fn shutdown() {
         // SAFETY: `hwnd()` is our window, registered in `attach`.
         let _ = unsafe { DeregisterShellHookWindow(hwnd()) };
     }
-    apps::remove_winevent_hook(); // idempotent: main already calls it in cleanup
     render::destroy();
 }
 
@@ -1387,6 +1459,15 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             popup::on_start_icons(icon_px, icons);
             return false;
         }
+        // Spatial sound and per-app mixer data: only the audio popup uses them.
+        ShellEvent::Spatial(state) => {
+            popup::on_audio_spatial(state);
+            return false;
+        }
+        ShellEvent::AudioSessions(list) => {
+            popup::on_audio_sessions(list);
+            return false;
+        }
         other => other,
     };
     UI.with(|u| {
@@ -1420,7 +1501,11 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
                 false
             }
             // Handled before the borrow.
-            ShellEvent::Network(_) | ShellEvent::StartApps(_) | ShellEvent::StartIcons { .. } => false,
+            ShellEvent::Network(_)
+            | ShellEvent::StartApps(_)
+            | ShellEvent::StartIcons { .. }
+            | ShellEvent::Spatial(_)
+            | ShellEvent::AudioSessions(_) => false,
         }
     })
 }
@@ -1679,7 +1764,7 @@ fn on_hover_picker_timer(h: HWND) {
     }
     let Some((i, key, name)) = multi_window_app(hover) else { return };
     let Some(a) = anchor_for(ItemId::App(i)) else { return };
-    let name = if name.is_empty() { "Window".to_string() } else { name };
+    let name = if name.is_empty() { crate::i18n::tr("Window", "Finestra").to_string() } else { name };
     crate::picker::open(a, &key, &name, &apps::windows_in_order(&key));
 }
 
@@ -2637,13 +2722,14 @@ fn dock_dpi() -> u32 {
 }
 
 fn dock_monitor() -> Result<MONITORINFO, String> {
-    let mon = dock_hmonitor();
+    monitor_info(dock_hmonitor()).ok_or_else(|| "GetMonitorInfoW failed".into())
+}
+
+/// Monitor and work area rects of display `h` (`None` if the call fails).
+pub(crate) fn monitor_info(h: HMONITOR) -> Option<MONITORINFO> {
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: `mi` has cbSize initialized and is writable.
-    if !unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
-        return Err("GetMonitorInfoW failed".into());
-    }
-    Ok(mi)
+    unsafe { GetMonitorInfoW(h, &mut mi) }.as_bool().then_some(mi)
 }
 
 /// Geometry: bar of `bar_w` physical px, horizontally centered on the work area of the bar's
@@ -2753,6 +2839,7 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
     if !was_visible {
         FS_SHOWN.store(fs.is_some(), Relaxed);
         FS_PREV.store(fs.map(|h| h.0 as isize).unwrap_or(0), Relaxed);
+        FS_RETAKES.store(0, Relaxed);
         CLICK_DOWN.store(mouse_buttons_down(), Relaxed);
         if let Some(h) = fs {
             log!("  fullscreen foreground window: \"{}\"", window_title(h));
@@ -2767,10 +2854,19 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
 /// Hides the dock. If it was over a fullscreen app and the foreground is still ours (timeout,
 /// Win key), it gives the foreground back to that app.
 pub fn hide_dock(reason: &str) {
+    hide(reason, false);
+}
+
+/// `hide_dock` without the slide+fade out (`now`), or with it unless over a fullscreen app.
+fn hide(reason: &str, now: bool) {
     // Hiding over a fullscreen app is instant; otherwise slide+fade out.
-    let instant = FS_SHOWN.swap(false, Relaxed);
-    let prev = if instant { FS_PREV.swap(0, Relaxed) } else { 0 };
-    crate::popup::close("dock hidden");
+    let fs = FS_SHOWN.swap(false, Relaxed);
+    let instant = now || fs;
+    let prev = if fs { FS_PREV.swap(0, Relaxed) } else { 0 };
+    // A popup linked to the bar (`start_with_bar`) fades out with it and closes in `on_vis_tick`.
+    if instant || !crate::popup::is_linked() {
+        crate::popup::close("dock hidden");
+    }
     picker_cancel("dock hidden");
     if instant {
         stop_vis_anim(0.0);
@@ -2985,9 +3081,7 @@ fn fullscreen_window(mon: &RECT) -> Option<HWND> {
     // The window's monitor must be the dock's, and the window must cover it entirely.
     // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
     let hm = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) };
-    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-    // SAFETY: `mi` has cbSize initialized and is writable.
-    if !unsafe { GetMonitorInfoW(hm, &mut mi) }.as_bool() || !rect_eq(&mi.rcMonitor, mon) {
+    if !monitor_info(hm).is_some_and(|mi| rect_eq(&mi.rcMonitor, mon)) {
         return None;
     }
     let full = r.left <= mon.left && r.top <= mon.top && r.right >= mon.right && r.bottom >= mon.bottom;
@@ -3002,6 +3096,13 @@ fn on_foreground_changed(fg: HWND) {
     if !VISIBLE.load(Relaxed) || fg.0.is_null() || is_own_window(fg) || tray_host::foreign_menu_active() {
         return;
     }
+    // The event is posted: by now the foreground may already be ours again (stale event).
+    // SAFETY: no preconditions.
+    let cur = unsafe { GetForegroundWindow() };
+    if !cur.0.is_null() && is_own_window(cur) {
+        log!("foreground event ignored: the foreground is ours again");
+        return;
+    }
     let Some(g) = GEOM.with(|g| g.get()) else { return };
     if FS_SHOWN.load(Relaxed) {
         // Closing one of our popups gives the foreground back to the game: it is not a user click.
@@ -3010,10 +3111,31 @@ fn on_foreground_changed(fg: HWND) {
             log!("foreground returned to the game by closing a popup: the dock stays");
             return;
         }
+        // The game bounced the foreground back right after we took it: take it again (a few times).
+        if fs_bounce_grace(fg) && FS_RETAKES.load(Relaxed) < FS_MAX_RETAKES {
+            let n = FS_RETAKES.fetch_add(1, Relaxed) + 1;
+            log!("fullscreen app bounced the foreground back right after the dock took it: re-taking it ({n})");
+            force_foreground(popup::current_hwnd().unwrap_or_else(hwnd));
+            return;
+        }
         hide_dock("foreground moved to another window (fullscreen)");
     } else if fullscreen_window(&g.mon).is_some() {
         hide_dock("a fullscreen app took the foreground");
     }
+}
+
+/// true if `fg` is the fullscreen app under the dock and the dock/popup took the foreground less
+/// than `FS_BOUNCE_GRACE_MS` ago: the change is the app bouncing it back, not a user action.
+/// `pub` because `popup` must not close on that bounce either.
+pub fn fs_bounce_grace(fg: HWND) -> bool {
+    FS_SHOWN.load(Relaxed)
+        && fg.0 as isize == FS_PREV.load(Relaxed)
+        && within_grace(now_ms(), FG_TAKEN_AT.load(Relaxed), FS_BOUNCE_GRACE_MS)
+}
+
+/// true if `taken_at` (0 = never) is less than `grace` ms before `now`.
+fn within_grace(now: u64, taken_at: u64, grace: u64) -> bool {
+    taken_at != 0 && now.saturating_sub(taken_at) < grace
 }
 
 /// "Foreground" fallback (the foreground fallback of the original design).
@@ -3022,6 +3144,7 @@ fn on_foreground_changed(fg: HWND) {
 /// lock) and SetForegroundWindow again. The outcome of each is in the log.
 /// `pub` because `popup` also uses it to activate the popup window.
 pub fn force_foreground(h: HWND) {
+    FG_TAKEN_AT.store(now_ms(), Relaxed);
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() {
@@ -3071,8 +3194,8 @@ fn send_f15() -> u32 {
 
 /// With several monitors: the edge `y == mon.top` (or `mon.bottom - 1`) is a real screen border
 /// only if there is no other monitor right beyond it (otherwise the cursor crosses it freely).
-fn edge_is_screen_border(g: &Geom, x: i32) -> bool {
-    let beyond = if config_top() { POINT { x, y: g.mon.top - 1 } } else { POINT { x, y: g.mon.bottom } };
+fn edge_is_screen_border(mon: &RECT, x: i32) -> bool {
+    let beyond = if config_top() { POINT { x, y: mon.top - 1 } } else { POINT { x, y: mon.bottom } };
     // SAFETY: MonitorFromPoint with MONITOR_DEFAULTTONULL has no preconditions; returns NULL if outside.
     let other = unsafe { MonitorFromPoint(beyond, MONITOR_DEFAULTTONULL) };
     other.0.is_null()
@@ -3138,12 +3261,17 @@ fn on_poll() {
         }
     }
     // Screen edge: y==top (bar at the top) or y==bottom-1 (bar at the bottom), on the bar's display.
-    let edge_y = if config_top() { g.mon.top } else { g.mon.bottom - 1 };
-    let at_edge = p.y == edge_y && p.x >= g.mon.left && p.x < g.mon.right && edge_is_screen_border(&g, p.x);
+    // "pointer" mode: on the display under the pointer, which the bar then moves to (even while still
+    // visible on another display).
+    let follow = follows_pointer();
+    let mon = if follow { monitor_info(pointer_hmonitor()).map_or(g.mon, |mi| mi.rcMonitor) } else { g.mon };
+    let other_display = !rect_eq(&mon, &g.mon);
+    let edge_y = if config_top() { mon.top } else { mon.bottom - 1 };
+    let at_edge = p.y == edge_y && p.x >= mon.left && p.x < mon.right && edge_is_screen_border(&mon, p.x);
     if !at_edge {
         EDGE_SINCE.store(0, Relaxed);
         EDGE_ARMED.store(true, Relaxed); // re-arms only after leaving the edge
-    } else if !VISIBLE.load(Relaxed) && EDGE_ARMED.load(Relaxed) {
+    } else if (!VISIBLE.load(Relaxed) || other_display) && EDGE_ARMED.load(Relaxed) {
         let since = EDGE_SINCE.load(Relaxed);
         if since == 0 {
             EDGE_SINCE.store(now, Relaxed);
@@ -3151,7 +3279,10 @@ fn on_poll() {
             EDGE_SINCE.store(0, Relaxed);
             EDGE_ARMED.store(false, Relaxed);
             // On fullscreen / borderless apps the edge does NOT open the dock: only the Win key.
-            if fullscreen_window(&g.mon).is_none() {
+            if fullscreen_window(&mon).is_none() {
+                if other_display {
+                    follow_pointer();
+                }
                 show_dock("screen edge", SHOW_MS);
             }
         }
@@ -3203,5 +3334,14 @@ mod tests {
         reorder_pinned(&mut c, &["c".to_string(), "a".to_string(), "b".to_string()]);
         let keys: Vec<&str> = c.pinned.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(keys, ["c", "x", "a", "b"]);
+    }
+
+    #[test]
+    fn bounce_grace_window_edges() {
+        assert!(!within_grace(1000, 0, 800), "never taken");
+        assert!(within_grace(1000, 1000, 800));
+        assert!(within_grace(1799, 1000, 800));
+        assert!(!within_grace(1800, 1000, 800));
+        assert!(within_grace(900, 1000, 800), "clock before the take saturates to 0");
     }
 }

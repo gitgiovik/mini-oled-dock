@@ -51,23 +51,26 @@ impl NetworkPopup {
     /// Detail rows (label, value).
     fn rows(&self) -> Vec<(&'static str, String)> {
         let i = &self.info;
-        let mut v = vec![("Internet", if i.kind != NetKind::None && i.internet { "Connected" } else { "No access" }.to_string())];
+        let tr = crate::i18n::tr;
+        let on = i.kind != NetKind::None && i.internet;
+        let mut v = vec![("Internet", if on { tr("Connected", "Connesso") } else { tr("No access", "Nessun accesso") }.to_string())];
         if i.kind != NetKind::None {
-            v.push(("IPv4 address", if i.ipv4.is_empty() { "\u{2014}".to_string() } else { i.ipv4.clone() }));
+            v.push((tr("IPv4 address", "Indirizzo IPv4"), if i.ipv4.is_empty() { "\u{2014}".to_string() } else { i.ipv4.clone() }));
         }
         if i.kind == NetKind::Wifi {
-            v.push(("Signal", format!("{}%", i.signal)));
+            v.push((tr("Signal", "Segnale"), format!("{}%", i.signal)));
         }
         v
     }
 
     fn title(&self) -> (String, String) {
         let i = &self.info;
+        let tr = crate::i18n::tr;
         match i.kind {
-            NetKind::None => ("Not connected".to_string(), "No network".to_string()),
+            NetKind::None => (tr("Not connected", "Non connesso").to_string(), tr("No network", "Nessuna rete").to_string()),
             NetKind::Wifi => (if i.name.is_empty() { "Wi-Fi".to_string() } else { i.name.clone() }, "Wi-Fi".to_string()),
             NetKind::Ethernet => {
-                (if i.name.is_empty() { "Ethernet".to_string() } else { i.name.clone() }, "Wired".to_string())
+                (if i.name.is_empty() { "Ethernet".to_string() } else { i.name.clone() }, tr("Wired", "Cablata").to_string())
             }
         }
     }
@@ -150,7 +153,7 @@ impl Content for NetworkPopup {
         hline(s, col, self.width - col, self.sep2);
         if let Some(rc) = self.hits.rect(ID_SETTINGS) {
             let h = row_plate(s, rc, ID_SETTINGS, hot, pressed);
-            s.text("Network settings", rc.left + m.px(12), center_y(&rc, ln), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+            s.text(crate::i18n::tr("Network settings", "Impostazioni di rete"), rc.left + m.px(12), center_y(&rc, ln), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
         }
     }
 

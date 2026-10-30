@@ -66,9 +66,10 @@ fn seconds_on(cfg: &crate::config::Config) -> bool {
 fn fmt_time(st: &SYSTEMTIME, pic: &str) -> Option<String> {
     let mut buf = [0u16; 64];
     let p = to_wide(pic);
-    // SAFETY: `st`, `buf` and `p` (nul-terminated) are valid for the call; locale NULL = user default.
-    let n =
-        unsafe { GetTimeFormatEx(PCWSTR::null(), TIME_FORMAT_FLAGS(0), Some(st), PCWSTR(p.as_ptr()), Some(&mut buf)) };
+    // SAFETY: `st`, `buf` and `p` (nul-terminated) are valid for the call; locale: `i18n::locale`
+    // (NULL = user default, or a static nul-terminated name).
+    let loc = crate::i18n::locale();
+    let n = unsafe { GetTimeFormatEx(loc, TIME_FORMAT_FLAGS(0), Some(st), PCWSTR(p.as_ptr()), Some(&mut buf)) };
     wide(&buf, n)
 }
 
@@ -78,7 +79,7 @@ fn fmt_date(st: &SYSTEMTIME, pic: &str) -> Option<String> {
     // SAFETY: as in `fmt_time`; calendar NULL = locale default.
     let n = unsafe {
         GetDateFormatEx(
-            PCWSTR::null(),
+            crate::i18n::locale(),
             ENUM_DATE_FORMATS_FLAGS(0),
             Some(st),
             PCWSTR(p.as_ptr()),

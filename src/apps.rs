@@ -706,6 +706,12 @@ impl Drop for OwnedProcess {
     }
 }
 
+/// Exe path of process `pid` (`None` if it cannot be opened). Used by the audio mixer for app names.
+pub(crate) fn exe_path_of_pid(pid: u32) -> Option<String> {
+    let proc = OwnedProcess::open(pid)?;
+    query_exe_path(proc.0)
+}
+
 fn query_exe_path(proc: HANDLE) -> Option<String> {
     // Common case: stack buffer, no heap allocation.
     let mut small = [0u16; 512];

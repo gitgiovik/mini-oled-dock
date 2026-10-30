@@ -200,7 +200,7 @@ impl Content for CalendarPopup {
         if let Some(rc) = self.hits.rect(ID_SETTINGS) {
             let h = row_plate(s, rc, ID_SETTINGS, hot, pressed);
             let y = center_y(&rc, s.line_height(Font::Normal));
-            s.text("Date & time settings", rc.left + s.metrics().px(12), y, Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+            s.text(crate::i18n::tr("Date & time settings", "Impostazioni data e ora"), rc.left + s.metrics().px(12), y, Font::Normal, WHITE, lift(TEXT_ALPHA, h));
         }
     }
 

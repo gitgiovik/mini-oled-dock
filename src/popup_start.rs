@@ -11,9 +11,9 @@
 //!
 //! Declared as a child module of `popup` (`#[path]`).
 
-use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
 
+use crate::i18n::tr;
 use crate::popup::{center_y, hline, lift, row_plate, Content, HitMap, PopupKind, Reply};
 use crate::power::{self, PowerAction};
 use crate::shell_thread::{self, AdminTool, ShellRequest};
@@ -34,87 +34,35 @@ enum Act {
 
 const VK_S: VIRTUAL_KEY = VIRTUAL_KEY(0x53);
 const VK_R: VIRTUAL_KEY = VIRTUAL_KEY(0x52);
-/// `PRIMARYLANGID` of Italian (`LANG_ITALIAN`; its feature module is not enabled for one constant).
-const LANG_ITALIAN: u16 = 0x10;
+
+/// One row: action and label (English, Italian; picked by `i18n::tr`, like every other text).
+type Row = (Act, &'static str, &'static str);
 
 /// Rows in the order of the native Win+X menu (`None` = separator). The row id is its index + 1.
-const ROWS: [Option<Act>; 18] = [
-    Some(Act::Launch("ms-settings:appsfeatures")),
-    Some(Act::Launch("ms-settings:powersleep")),
-    Some(Act::Launch("eventvwr.msc")),
-    Some(Act::Launch("ms-settings:about")),
-    Some(Act::Launch("devmgmt.msc")),
-    Some(Act::Launch("ms-settings:network")),
-    Some(Act::Launch("diskmgmt.msc")),
-    Some(Act::Launch("compmgmt.msc")),
-    Some(Act::Admin(AdminTool::Terminal)),
-    Some(Act::Admin(AdminTool::PowerShell)),
+const ROWS: [Option<Row>; 18] = [
+    Some((Act::Launch("ms-settings:appsfeatures"), "Installed apps", "App installate")),
+    Some((Act::Launch("ms-settings:powersleep"), "Power Options", "Opzioni spegnimento")),
+    Some((Act::Launch("eventvwr.msc"), "Event Viewer", "Visualizzatore eventi")),
+    Some((Act::Launch("ms-settings:about"), "System", "Sistema")),
+    Some((Act::Launch("devmgmt.msc"), "Device Manager", "Gestione dispositivi")),
+    Some((Act::Launch("ms-settings:network"), "Network Connections", "Connessioni di rete")),
+    Some((Act::Launch("diskmgmt.msc"), "Disk Management", "Gestione disco")),
+    Some((Act::Launch("compmgmt.msc"), "Computer Management", "Gestione computer")),
+    Some((Act::Admin(AdminTool::Terminal), "Terminal (admin)", "Terminale (admin)")),
+    Some((Act::Admin(AdminTool::PowerShell), "PowerShell (admin)", "PowerShell (admin)")),
     None,
-    Some(Act::Launch("taskmgr.exe")),
-    Some(Act::Launch("ms-settings:")),
-    Some(Act::Launch("explorer.exe")),
-    Some(Act::WinKey(VK_S)),
-    Some(Act::WinKey(VK_R)),
+    Some((Act::Launch("taskmgr.exe"), "Task Manager", "Gestione attivit\u{e0}")),
+    Some((Act::Launch("ms-settings:"), "Settings", "Impostazioni")),
+    Some((Act::Launch("explorer.exe"), "File Explorer", "Esplora file")),
+    Some((Act::WinKey(VK_S), "Search", "Cerca")),
+    Some((Act::WinKey(VK_R), "Run", "Esegui")),
     None,
-    Some(Act::SignOut),
+    Some((Act::SignOut, "Sign out", "Disconnetti")),
 ];
 
-// This menu is the only localized part of the dock (Italian UI language, English otherwise).
-/// English labels by row index (`""` = separator).
-const LABELS_EN: &[&str] = &[
-    "Installed apps",
-    "Power Options",
-    "Event Viewer",
-    "System",
-    "Device Manager",
-    "Network Connections",
-    "Disk Management",
-    "Computer Management",
-    "Terminal (admin)",
-    "PowerShell (admin)",
-    "",
-    "Task Manager",
-    "Settings",
-    "File Explorer",
-    "Search",
-    "Run",
-    "",
-    "Sign out",
-];
-
-/// Italian labels by row index (`""` = separator).
-const LABELS_IT: &[&str] = &[
-    "App installate",
-    "Opzioni spegnimento",
-    "Visualizzatore eventi",
-    "Sistema",
-    "Gestione dispositivi",
-    "Connessioni di rete",
-    "Gestione disco",
-    "Gestione computer",
-    "Terminale (admin)",
-    "PowerShell (admin)",
-    "",
-    "Gestione attivit\u{e0}",
-    "Impostazioni",
-    "Esplora file",
-    "Cerca",
-    "Esegui",
-    "",
-    "Disconnetti",
-];
-
-/// Label of row `i` in the chosen language (`""` for separators).
-fn label(i: usize, italian: bool) -> &'static str {
-    let table = if italian { LABELS_IT } else { LABELS_EN };
-    table.get(i).copied().unwrap_or("")
-}
-
-/// True when the user's Windows UI language is Italian (`PRIMARYLANGID == LANG_ITALIAN`).
-pub(crate) fn ui_is_italian() -> bool {
-    // SAFETY: no arguments, no preconditions; returns a LANGID.
-    let langid = unsafe { GetUserDefaultUILanguage() };
-    langid & 0x3ff == LANG_ITALIAN
+/// Label of row `i` in the dock language (`""` for separators).
+fn label(i: usize) -> &'static str {
+    ROWS.get(i).copied().flatten().map_or("", |(_, en, it)| tr(en, it))
 }
 
 pub(crate) struct StartPopup {
@@ -122,22 +70,12 @@ pub(crate) struct StartPopup {
     /// Row chosen, run after closing.
     pending: Option<Act>,
     width: i32,
-    /// Label language, read when the popup is built.
-    italian: bool,
 }
 
-/// Creates the content (initial state), labels in the user's UI language.
+/// Creates the content (initial state). Labels follow the dock language (`i18n`; English in
+/// preview mode, so the README screenshot does not depend on the machine).
 pub(crate) fn new() -> Box<dyn Content> {
-    with_language(ui_is_italian())
-}
-
-/// Preview: always English, so the README screenshot does not depend on the machine.
-pub(crate) fn preview_new() -> Box<dyn Content> {
-    with_language(false)
-}
-
-fn with_language(italian: bool) -> Box<dyn Content> {
-    Box::new(StartPopup { hits: HitMap::default(), pending: None, width: 0, italian })
+    Box::new(StartPopup { hits: HitMap::default(), pending: None, width: 0 })
 }
 
 /// Height taken by a separator row (physical px): space, 1 px line, space.
@@ -153,7 +91,7 @@ impl Content for StartPopup {
     fn size(&mut self, s: &Surface) -> (i32, i32) {
         let m = s.metrics();
         let (inset, row, pad_text) = (m.px(8), m.px(34), m.px(12));
-        let tw = (0..ROWS.len()).map(|i| s.text_width(label(i, self.italian), Font::Normal)).max().unwrap_or(0);
+        let tw = (0..ROWS.len()).map(|i| s.text_width(label(i), Font::Normal)).max().unwrap_or(0);
         let w = (tw + 2 * pad_text + 2 * inset).clamp(m.px(190), m.px(300));
         self.width = w;
         self.hits.clear();
@@ -184,7 +122,7 @@ impl Content for StartPopup {
             y = rc.bottom;
             let h = row_plate(s, rc, i as u32 + 1, hot, pressed);
             let ty = center_y(&rc, s.line_height(Font::Normal));
-            s.text(label(i, self.italian), rc.left + pad_text, ty, Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+            s.text(label(i), rc.left + pad_text, ty, Font::Normal, WHITE, lift(TEXT_ALPHA, h));
         }
     }
 
@@ -193,7 +131,7 @@ impl Content for StartPopup {
     }
 
     fn click(&mut self, id: u32) -> Reply {
-        self.pending = ROWS.get((id as usize).wrapping_sub(1)).copied().flatten();
+        self.pending = ROWS.get((id as usize).wrapping_sub(1)).copied().flatten().map(|(act, _, _)| act);
         Reply::Close
     }
 
@@ -204,22 +142,6 @@ impl Content for StartPopup {
             Some(Act::WinKey(vk)) => crate::ui::send_win_key(vk),
             Some(Act::SignOut) => power::run(PowerAction::SignOut),
             None => {}
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn label_tables_match_rows() {
-        assert_eq!(LABELS_EN.len(), ROWS.len());
-        assert_eq!(LABELS_IT.len(), ROWS.len());
-        for (i, r) in ROWS.iter().enumerate() {
-            // Separators have no label; every action has one in both languages.
-            assert_eq!(r.is_none(), LABELS_EN[i].is_empty(), "row {i}");
-            assert_eq!(r.is_none(), LABELS_IT[i].is_empty(), "row {i}");
         }
     }
 }

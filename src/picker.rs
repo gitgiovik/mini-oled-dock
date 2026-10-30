@@ -286,7 +286,7 @@ pub(crate) fn preview_pixels(
     hot: Option<usize>,
 ) -> Option<(i32, i32, Vec<u32>)> {
     let mut s = Surface::new(m).ok()?;
-    let titles: Vec<String> = titles.iter().map(|t| clean_title(t, "Window")).collect();
+    let titles: Vec<String> = titles.iter().map(|t| clean_title(t, crate::i18n::tr("Window", "Finestra"))).collect();
     let g = layout(m, sources, max_w, i32::MAX, column_width(&s, &titles));
     let titles = ellipsize_titles(&s, &g, &titles);
     s.resize(g.w, g.h).ok()?;

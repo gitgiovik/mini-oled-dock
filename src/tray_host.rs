@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows::core::{w, GUID, PCWSTR, PWSTR};
+use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
@@ -34,12 +34,12 @@ use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY,
 };
-use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_SUBKEY_WOW6464KEY};
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    GetCurrentProcessId, OpenProcess, OpenProcessToken,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Shell::{SHAllocShared, SHFreeShared, SHLockShared, SHUnlockShared};
@@ -1010,9 +1010,12 @@ pub fn click(id: u64, kind: TrayClick, anchor: POINT) {
         return;
     }
     allow_foreground(t.pid);
-    let anchor = if kind == TrayClick::Middle { anchor } else { menu_anchor(anchor) };
+    let anchor = if kind == TrayClick::Middle { anchor } else { menu_anchor(id, anchor) };
     if kind != TrayClick::Middle {
         note_click(t.pid);
+    }
+    if kind == TrayClick::Right {
+        arm_placement(id, t.pid);
     }
     for ev in click_events(kind, t.version) {
         send_callback(&t, ev, anchor);
@@ -1040,15 +1043,205 @@ fn note_click(pid: u32) {
     LAST_CLICK_MS.store(now_ms(), Relaxed);
 }
 
-/// Point passed to the app as the menu anchor: with the bar at the top it is just BELOW the bar, so
-/// menus (v4: `wParam`) open below and not over it; at the bottom it stays the cursor.
-fn menu_anchor(p: POINT) -> POINT {
-    let g = state().geom;
-    if g.edge == 1 && g.bar.bottom > g.bar.top {
-        POINT { x: p.x, y: g.bar.bottom + 1 }
-    } else {
-        p
+/// Point passed to the app as the menu anchor (v4: `wParam`): horizontally the CENTER of the clicked
+/// icon (cursor x if its rect is unknown), vertically just outside the bar (above it at the bottom,
+/// below it at the top), so menus open next to the bar and never over the icons.
+fn menu_anchor(id: u64, p: POINT) -> POINT {
+    let st = state();
+    let g = st.geom;
+    let x = st.rects.iter().find(|(i, _)| *i == id).map_or(p.x, |(_, r)| (r.left + r.right) / 2);
+    anchor_point(&g, x, p)
+}
+
+/// Pure part of `menu_anchor` (tested).
+fn anchor_point(g: &TrayGeometry, x: i32, p: POINT) -> POINT {
+    if g.bar.bottom <= g.bar.top {
+        return p;
     }
+    if g.edge == 1 {
+        POINT { x, y: g.bar.bottom + 1 }
+    } else {
+        POINT { x, y: g.bar.top - 1 }
+    }
+}
+
+// ------------------------------------------------------------------ placing the app's own menu
+
+/// How long (ms) after a right click a window of the app is considered its context menu.
+const PLACE_WINDOW_MS: u64 = 3000;
+/// Maximum re-placements of the same window (an app that keeps moving it back wins).
+const PLACE_MAX_MOVES: u32 = 6;
+const TIMER_PLACE: usize = 3;
+const WM_HOST_PLACE_ARM: u32 = WM_APP + 4;
+
+/// Pending placement: the next context menu / flyout shown by `pid` is moved so that it is centered
+/// on the clicked icon, `POPUP_GAP` above (or below) the bar, exactly like the dock's own popups.
+#[derive(Clone, Copy)]
+struct Placement {
+    pid: u32,
+    item: RECT,
+    bar: RECT,
+    top: bool,
+    until_ms: u64,
+    /// Window already placed (0 = none yet): only the FIRST one is taken (submenus stay native).
+    placed: isize,
+    moves: u32,
+}
+
+static PLACEMENT: Mutex<Option<Placement>> = Mutex::new(None);
+/// Raw `HWINEVENTHOOK`s installed by the host thread for the current placement.
+static PLACE_HOOKS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+fn placement() -> MutexGuard<'static, Option<Placement>> {
+    PLACEMENT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Called by `click` on a right click: records icon/bar and asks the host thread to hook the
+/// owner's window events (filtered by pid, only for `PLACE_WINDOW_MS`).
+fn arm_placement(id: u64, pid: u32) {
+    let (item, g) = {
+        let st = state();
+        (st.rects.iter().find(|(i, _)| *i == id).map(|(_, r)| *r), st.geom)
+    };
+    let Some(item) = item.filter(|r| r.right > r.left) else { return };
+    if g.bar.bottom <= g.bar.top {
+        return;
+    }
+    *placement() = Some(Placement {
+        pid,
+        item,
+        bar: g.bar,
+        top: g.edge == 1,
+        until_ms: now_ms() + PLACE_WINDOW_MS,
+        placed: 0,
+        moves: 0,
+    });
+    let h = HOST_HWND.load(Relaxed);
+    if h != 0 {
+        // SAFETY: PostMessageW is thread-safe; if the window is gone it merely fails.
+        let _ = unsafe { PostMessageW(Some(hwnd_of(h)), WM_HOST_PLACE_ARM, WPARAM(pid as usize), LPARAM(0)) };
+    }
+}
+
+/// Host thread: (re)installs the out-of-context hooks for `pid` and the disarm timer.
+fn place_arm(host: HWND, pid: u32) {
+    use windows::Win32::UI::Accessibility::SetWinEventHook;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_MENUPOPUPSTART, WINEVENT_OUTOFCONTEXT,
+    };
+    place_disarm(host);
+    let mut hooks = PLACE_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    for ev in [EVENT_SYSTEM_MENUPOPUPSTART, EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE] {
+        // SAFETY: `place_winevent_proc` is a 'static extern "system" fn with the WINEVENTPROC
+        // signature; out-of-context (no module); this thread runs a message loop.
+        let hk = unsafe { SetWinEventHook(ev, ev, None, Some(place_winevent_proc), pid, 0, WINEVENT_OUTOFCONTEXT) };
+        if hk.is_invalid() {
+            log!("tray: SetWinEventHook(0x{ev:X}, pid {pid}) failed: {:?}", windows::core::Error::from_thread());
+        } else {
+            hooks.push(hk.0 as isize);
+        }
+    }
+    // SAFETY: own window, same thread.
+    unsafe { SetTimer(Some(host), TIMER_PLACE, PLACE_WINDOW_MS as u32, None) };
+}
+
+/// Host thread: removes the placement hooks and timer. Idempotent.
+fn place_disarm(host: HWND) {
+    use windows::Win32::UI::Accessibility::{UnhookWinEvent, HWINEVENTHOOK};
+    let hooks = std::mem::take(&mut *PLACE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()));
+    for h in hooks {
+        // SAFETY: handle obtained from SetWinEventHook on this thread and removed from the list above.
+        let _ = unsafe { UnhookWinEvent(HWINEVENTHOOK(h as *mut c_void)) };
+    }
+    // SAFETY: own window, same thread; fails harmlessly if the timer does not exist.
+    let _ = unsafe { KillTimer(Some(host), TIMER_PLACE) };
+}
+
+/// true if `h` looks like a context menu / flyout: visible top-level, no title bar, not a child,
+/// sensible size (not a frameless main window).
+fn is_menu_candidate(h: HWND, work: &RECT) -> Option<RECT> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetDesktopWindow, GA_PARENT};
+    // SAFETY: functions without preconditions; invalid handles just fail.
+    unsafe {
+        if !IsWindowVisible(h).as_bool() || GetAncestor(h, GA_PARENT) != GetDesktopWindow() {
+            return None;
+        }
+        let style = GetWindowLongW(h, GWL_STYLE) as u32;
+        if style & WS_CAPTION.0 == WS_CAPTION.0 || style & WS_CHILD.0 != 0 {
+            return None;
+        }
+        let mut rc = RECT::default();
+        GetWindowRect(h, &mut rc).ok()?;
+        let (w, ht) = (rc.right - rc.left, rc.bottom - rc.top);
+        let (ww, wh) = (work.right - work.left, work.bottom - work.top);
+        (w >= 24 && ht >= 16 && w * 10 <= ww * 6 && ht <= wh).then_some(rc)
+    }
+}
+
+/// Target top-left of a `w` x `h` menu for placement `p` (same rule as the dock's popups).
+fn place_target(p: &Placement, w: i32, h: i32) -> (i32, i32) {
+    let ui = UI_HWND.load(Relaxed);
+    // SAFETY: no preconditions; 0 for an invalid window.
+    let dpi = if ui == 0 { 96 } else { unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd_of(ui)) } };
+    let a = crate::popup::Anchor { item: p.item, bar: p.bar, top: p.top, dpi: dpi.max(96) };
+    crate::popup::compute_pos(&a, w, h)
+}
+
+unsafe extern "system" fn place_winevent_proc(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CHILDID_SELF, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_MENUPOPUPSTART, OBJID_WINDOW,
+    };
+    if hwnd.0.is_null() {
+        return;
+    }
+    if event != EVENT_SYSTEM_MENUPOPUPSTART && (id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32) {
+        return;
+    }
+    let mut guard = placement();
+    let Some(p) = guard.as_mut() else { return };
+    if now_ms() > p.until_ms || window_pid(hwnd) != p.pid {
+        return;
+    }
+    let raw = hwnd.0 as isize;
+    if event == EVENT_OBJECT_LOCATIONCHANGE {
+        if raw != p.placed || p.moves >= PLACE_MAX_MOVES {
+            return;
+        }
+    } else if p.placed != 0 {
+        return;
+    }
+    let work = crate::popup::work_area(&p.bar);
+    let Some(rc) = is_menu_candidate(hwnd, &work) else { return };
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    let (x, y) = place_target(p, w, h);
+    p.placed = raw;
+    if (rc.left, rc.top) == (x, y) {
+        return;
+    }
+    p.moves += 1;
+    let p_copy = *p;
+    drop(guard);
+    // SAFETY: moving another process's top-level window; no size/Z-order/activation change.
+    if let Err(e) = unsafe { SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) } {
+        log!("tray: placing menu of pid {} failed: {e}", p_copy.pid);
+    } else if p_copy.moves == 1 {
+        log!("tray: menu of pid {} placed at ({x},{y}) {w}x{h} (was {},{})", p_copy.pid, rc.left, rc.top);
+    }
+}
+
+/// true while the window placed for the last right click is still visible.
+fn placed_menu_visible() -> bool {
+    let Some(p) = *placement() else { return false };
+    // SAFETY: no preconditions; false for a destroyed window.
+    p.placed != 0 && unsafe { IsWindowVisible(hwnd_of(p.placed)) }.as_bool()
 }
 
 fn rects_overlap(a: &RECT, b: &RECT) -> bool {
@@ -1119,6 +1312,9 @@ pub fn foreign_menu_active() -> bool {
         return true;
     }
     if system_menu_visible() {
+        return true;
+    }
+    if since < MENU_WINDOW_MS && placed_menu_visible() {
         return true;
     }
     if since < MENU_WINDOW_MS {
@@ -1300,9 +1496,10 @@ fn create_host() -> Result<(), String> {
     if unsafe { RegisterClassExW(&wc_child) } == 0 {
         log!("tray: RegisterClassExW(TrayNotifyWnd) failed: {:?}", windows::core::Error::from_thread());
     }
-    let g = state().geom;
-    let (x, y) = (g.tray_area.left, g.tray_area.top);
-    let (cw, ch) = ((g.tray_area.right - g.tray_area.left).max(1), (g.tray_area.bottom - g.tray_area.top).max(1));
+    let geom = state().geom;
+    let g = host_rect(&geom, monitor_rect_of(&geom.bar));
+    let (x, y) = (g.left, g.top);
+    let (cw, ch) = ((g.right - g.left).max(1), (g.bottom - g.top).max(1));
     // SAFETY: class registered above; static PCWSTR literals; the window is never shown.
     let host = unsafe {
         CreateWindowExW(
@@ -1430,6 +1627,7 @@ unsafe extern "system" fn host_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             match wp.0 {
                 TIMER_ZORDER => keep_first(hwnd),
                 TIMER_DEAD => sweep_dead(),
+                TIMER_PLACE => place_disarm(hwnd),
                 _ => {}
             }
             LRESULT(0)
@@ -1468,12 +1666,17 @@ unsafe extern "system" fn host_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             rescale_all();
             LRESULT(0)
         }
+        WM_HOST_PLACE_ARM => {
+            place_arm(hwnd, wp.0 as u32);
+            LRESULT(0)
+        }
         WM_CLOSE => {
             // SAFETY: own window, same thread.
             let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
         }
         WM_DESTROY => {
+            place_disarm(hwnd);
             // SAFETY: timers created by this thread on this window.
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_ZORDER);
@@ -1530,8 +1733,37 @@ fn sweep_dead() {
     }
 }
 
+/// Rectangle given to the hidden `Shell_TrayWnd`. Apps that position their own flyouts from
+/// `FindWindow("Shell_TrayWnd")` + `GetWindowRect` (e.g. Logitech G HUB's WinUI tray) infer the
+/// taskbar edge by comparing that rect with the monitor: a small floating rect matches no edge and
+/// they fall back to (0,0). So, like Explorer's, the window spans the monitor width and touches the
+/// screen edge, covering the bar's height. Pure (tested); `mon` = the bar's monitor rect.
+fn host_rect(g: &TrayGeometry, mon: RECT) -> RECT {
+    let b = g.bar;
+    if b.right <= b.left || b.bottom <= b.top || mon.right <= mon.left || mon.bottom <= mon.top {
+        return area_rect(g);
+    }
+    // Right edge = right end of the dock's tray area: such apps right-align their flyout to the
+    // taskbar's right end (where Explorer keeps the notification area), so it lands over our icons.
+    let right = area_rect(g).right.clamp(mon.left + 1, mon.right);
+    if g.edge == 1 {
+        RECT { left: mon.left, top: mon.top, right, bottom: b.bottom.clamp(mon.top + 1, mon.bottom) }
+    } else {
+        RECT { left: mon.left, top: b.top.clamp(mon.top, mon.bottom - 1), right, bottom: mon.bottom }
+    }
+}
+
+/// Monitor rectangle of `r` (nearest monitor); empty on failure.
+fn monitor_rect_of(r: &RECT) -> RECT {
+    use windows::Win32::Graphics::Gdi::{MonitorFromRect, MONITOR_DEFAULTTONEAREST};
+    // SAFETY: `r` is a valid RECT; MONITOR_DEFAULTTONEAREST always returns a monitor.
+    let mon = unsafe { MonitorFromRect(r, MONITOR_DEFAULTTONEAREST) };
+    crate::ui::monitor_info(mon).map_or(EMPTY_RECT, |mi| mi.rcMonitor)
+}
+
 fn resize_host(hwnd: HWND) {
-    let g = area_rect(&state().geom);
+    let geom = state().geom;
+    let g = host_rect(&geom, monitor_rect_of(&geom.bar));
     let (w, h) = ((g.right - g.left).max(1), (g.bottom - g.top).max(1));
     // SAFETY: own window, same thread; without SWP_SHOWWINDOW it stays hidden.
     if let Err(e) = unsafe { SetWindowPos(hwnd, None, g.left, g.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE) } {
@@ -1618,38 +1850,9 @@ fn forward_sync(wp: WPARAM, lp: LPARAM) -> LRESULT {
     LRESULT(res as isize)
 }
 
-/// Full path of the exe of process `pid` (empty if it cannot be opened).
-fn exe_path_of_pid(pid: u32) -> String {
-    // SAFETY: no preconditions; if the process cannot be opened it returns Err.
-    let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
-        return String::new();
-    };
-    let mut buf = [0u16; 520];
-    let mut len = buf.len() as u32;
-    // SAFETY: `buf` is writable with `len` elements; `h` opened above.
-    let r = unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) };
-    // SAFETY: handle opened above, closed exactly once.
-    let _ = unsafe { CloseHandle(h) };
-    if r.is_err() {
-        return String::new();
-    }
-    String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())])
-}
-
 /// File name of the exe from a full path.
 fn file_name_of(path: &str) -> String {
     path.rsplit('\\').next().unwrap_or("").to_string()
-}
-
-/// Version value `sub` inside block `buf`: pointer (into `buf`) and length.
-fn ver_query(buf: &[u64], sub: &str) -> Option<(*const u16, usize)> {
-    let wsub: Vec<u16> = sub.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut p: *mut c_void = std::ptr::null_mut();
-    let mut len = 0u32;
-    // SAFETY: `buf` holds a valid version block (GetFileVersionInfoW succeeded); `p` and `len`
-    // are writable; `wsub` is NUL-terminated.
-    let ok = unsafe { VerQueryValueW(buf.as_ptr().cast::<c_void>(), PCWSTR(wsub.as_ptr()), &mut p, &mut len) };
-    (ok.as_bool() && !p.is_null() && len > 0).then_some((p.cast::<u16>().cast_const(), len as usize))
 }
 
 /// `file_description` with a per-exe-path cache (many apps register together at login).
@@ -1668,44 +1871,21 @@ fn cached_file_description(path: &str) -> String {
     name
 }
 
-/// `FileDescription` from the exe's version resources (empty if absent or unreadable).
+/// `FileDescription` of the exe (empty if absent or unreadable), read like the bar's app names
+/// (`shell_thread::FileInfo`, `IShellItem2`). Runs on the short-lived `tray-name` thread, so it
+/// initializes COM for the duration of the read.
 fn file_description(path: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
-    let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: `wpath` is NUL-terminated and lives for the whole call.
-    let size = unsafe { GetFileVersionInfoSizeW(PCWSTR(wpath.as_ptr()), None) };
-    if size == 0 || size > (1 << 20) {
-        return String::new();
+    // SAFETY: COM STA for this thread (FileInfo::read uses IShellItem2), paired with CoUninitialize below.
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let name = crate::shell_thread::FileInfo::read(path).description.unwrap_or_default();
+    if hr.is_ok() {
+        // SAFETY: paired with the successful CoInitializeEx above; the shell item was dropped by `read`.
+        unsafe { CoUninitialize() };
     }
-    // u64 buffer for alignment; `size` bytes are needed.
-    let mut buf = vec![0u64; (size as usize).div_ceil(8)];
-    // SAFETY: `buf` has at least `size` writable bytes; `wpath` NUL-terminated.
-    let r = unsafe { GetFileVersionInfoW(PCWSTR(wpath.as_ptr()), None, size, buf.as_mut_ptr().cast::<c_void>()) };
-    if r.is_err() {
-        return String::new();
-    }
-    let mut langs: Vec<String> = Vec::new();
-    if let Some((p, len)) = ver_query(&buf, "\\VarFileInfo\\Translation") {
-        if len >= 4 {
-            // SAFETY: `p` points inside `buf` to at least `len >= 4` bytes (16-bit language and codepage).
-            let (lang, cp) = unsafe { (std::ptr::read_unaligned(p), std::ptr::read_unaligned(p.add(1))) };
-            langs.push(format!("{lang:04x}{cp:04x}"));
-        }
-    }
-    langs.extend(["040904b0".to_string(), "040904e4".to_string(), "000004b0".to_string()]);
-    for l in langs {
-        if let Some((p, len)) = ver_query(&buf, &format!("\\StringFileInfo\\{l}\\FileDescription")) {
-            // SAFETY: for a version string `len` is the number of UTF-16 characters inside `buf`.
-            let sl = unsafe { std::slice::from_raw_parts(p, len) };
-            let d = utf16_until_nul(sl).trim().to_string();
-            if !d.is_empty() {
-                return d;
-            }
-        }
-    }
-    String::new()
+    name
 }
 
 /// RID of the "medium" integrity level (`SECURITY_MANDATORY_MEDIUM_RID`).
@@ -1824,7 +2004,7 @@ fn handle_nim(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
     } else {
         IconUpdate::Keep
     };
-    let exe_path = if msg == NIM_ADD && pid != 0 { exe_path_of_pid(pid) } else { String::new() };
+    let exe_path = if msg == NIM_ADD && pid != 0 { crate::apps::exe_path_of_pid(pid).unwrap_or_default() } else { String::new() };
     let exe = file_name_of(&exe_path);
     let res = {
         let mut st = state();
@@ -1836,7 +2016,7 @@ fn handle_nim(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         // the host thread (the app is still blocked in its Shell_NotifyIcon). Reply immediately.
         let guid = (nid.flags & NIF_GUID != 0 && !guid_is_zero(&nid.guid)).then_some(nid.guid);
         let (uid, path) = (nid.uid, exe_path.clone());
-        if let Err(e) = std::thread::Builder::new().name("tray-name".into()).stack_size(128 * 1024).spawn(move || {
+        if let Err(e) = std::thread::Builder::new().name("tray-name".into()).stack_size(512 * 1024).spawn(move || {
             let name = cached_file_description(&path);
             if name.is_empty() {
                 return;
@@ -2168,6 +2348,21 @@ mod tests {
     }
 
     #[test]
+    fn menu_anchor_on_icon_center_outside_bar() {
+        let bar = RECT { left: 1000, top: 2065, right: 2800, bottom: 2146 };
+        let cursor = POINT { x: 2210, y: 2130 };
+        let bottom = TrayGeometry { bar, tray_area: bar, edge: 3 };
+        let p = anchor_point(&bottom, 2200, cursor);
+        assert_eq!((p.x, p.y), (2200, 2064));
+        let top = TrayGeometry { bar, tray_area: bar, edge: 1 };
+        let p = anchor_point(&top, 2200, cursor);
+        assert_eq!((p.x, p.y), (2200, 2147));
+        let none = TrayGeometry::default();
+        let p = anchor_point(&none, 2200, cursor);
+        assert_eq!((p.x, p.y), (cursor.x, cursor.y));
+    }
+
+    #[test]
     fn ciclo_nim() {
         let mut items = Vec::new();
         let mut next = 1u64;
@@ -2254,6 +2449,22 @@ mod tests {
         // No window: only the block's process is checked (unchanged).
         assert!(appbar_block_allowed(OWN, OWN, None, |p| p == OWN));
         assert!(!appbar_block_allowed(666, OWN, None, medium));
+    }
+
+    #[test]
+    fn host_rect_spans_monitor_edge() {
+        let mon = RECT { left: 0, top: 0, right: 3840, bottom: 2160 };
+        let bar = RECT { left: 1200, top: 2065, right: 2640, bottom: 2146 };
+        let g = TrayGeometry { bar, tray_area: RECT { left: 2198, top: 2065, right: 2582, bottom: 2146 }, edge: 3 };
+        let r = host_rect(&g, mon);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 2065, 2582, 2160));
+        let top_bar = RECT { left: 1200, top: 12, right: 2640, bottom: 93 };
+        let g = TrayGeometry { bar: top_bar, tray_area: top_bar, edge: 1 };
+        let r = host_rect(&g, mon);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 2640, 93));
+        // no geometry yet: falls back to the tray area / bar
+        let g = TrayGeometry { bar: EMPTY_RECT, tray_area: EMPTY_RECT, edge: 3 };
+        assert_eq!(host_rect(&g, mon).right, 0);
     }
 
     #[test]

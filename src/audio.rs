@@ -9,8 +9,18 @@
 //! the shell thread then calls `reopen_endpoint()` and posts WM_DOCK_VOLUME.
 //! Shutdown: `Unregister*Notify` BEFORE releasing the endpoint.
 
-use windows::core::{implement, interface, IUnknown, IUnknown_Vtbl, Result as WinResult, GUID, HRESULT, PCWSTR};
-use std::sync::atomic::{AtomicBool, Ordering};
+use windows::core::{
+    implement, interface, IUnknown, IUnknown_Vtbl, Interface, Result as WinResult, GUID, HRESULT, HSTRING, PCWSTR,
+};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+use windows::Media::Audio::{
+    SetDefaultSpatialAudioFormatStatus, SpatialAudioDeviceConfiguration, SpatialAudioFormatSubtype,
+};
+use windows::Win32::Media::Audio::{
+    AudioSessionStateExpired, IAudioSessionControl2, IAudioSessionManager2, ISimpleAudioVolume,
+};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{HWND, LPARAM, PROPERTYKEY, WPARAM};
@@ -27,7 +37,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, S
 use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
 
 use crate::log;
-use crate::msg::WM_SHELL_AUDIO_DEVICE_CHANGED;
+use crate::msg::{WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_SPATIAL_CHANGED};
 
 /// Wheel step (percentage points).
 pub const WHEEL_STEP_PERCENT: i32 = 2;
@@ -107,6 +117,493 @@ pub struct OutputDevice {
     pub is_default: bool,
     /// Form factor, for the icon.
     pub kind: DeviceKind,
+}
+
+/// Audio popup state for the shell thread, one byte: `POPUP_OPEN_BIT` while the popup is open, plus
+/// one `WANT_*` bit per section that is currently shown expanded (`popup_audio`, from
+/// `config::AudioLayout::loadable`). Written by the popup (UI thread), read by the shell thread to
+/// decide whether a device change or a finished spatial-format change must push fresh data: a
+/// collapsed or hidden section is never re-read, nothing is read while the popup is closed.
+static POPUP: AtomicU8 = AtomicU8::new(0);
+const POPUP_OPEN_BIT: u8 = 1;
+const WANT_OUTPUTS: u8 = 2;
+const WANT_SPATIAL: u8 = 4;
+const WANT_SESSIONS: u8 = 8;
+
+/// Popup opened / closed. Closing also drops every `WANT_*` bit.
+pub fn set_popup_open(open: bool) {
+    POPUP.store(if open { POPUP_OPEN_BIT } else { 0 }, Ordering::Relaxed);
+}
+
+/// Which sections of the open popup show their data (ignored while the popup is closed).
+pub fn set_popup_wants(outputs: bool, spatial: bool, sessions: bool) {
+    let bits = u8::from(outputs) * WANT_OUTPUTS | u8::from(spatial) * WANT_SPATIAL | u8::from(sessions) * WANT_SESSIONS;
+    // Only the UI thread writes this byte: a plain load + store is enough.
+    if POPUP.load(Ordering::Relaxed) & POPUP_OPEN_BIT != 0 {
+        POPUP.store(POPUP_OPEN_BIT | bits, Ordering::Relaxed);
+    }
+}
+
+fn popup_wants(bit: u8) -> bool {
+    let v = POPUP.load(Ordering::Relaxed);
+    v & POPUP_OPEN_BIT != 0 && v & bit != 0
+}
+
+/// The open popup shows the output devices.
+pub fn popup_wants_outputs() -> bool {
+    popup_wants(WANT_OUTPUTS)
+}
+
+/// The open popup shows the spatial sound formats.
+pub fn popup_wants_spatial() -> bool {
+    popup_wants(WANT_SPATIAL)
+}
+
+/// The open popup shows the volume mixer.
+pub fn popup_wants_sessions() -> bool {
+    popup_wants(WANT_SESSIONS)
+}
+
+// ------------------------------------------------- spatial sound (Windows.Media.Audio, WinRT)
+
+/// A spatial sound format the popup can offer. `Off` is the empty subtype.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpatialKind {
+    Off,
+    WindowsSonic,
+    DolbyAtmosHeadphones,
+    DolbyAtmosHomeTheater,
+    DtsHeadphoneX,
+    DtsXUltra,
+    DtsXHomeTheater,
+}
+
+impl SpatialKind {
+    /// The known formats (`SpatialAudioFormatSubtype`), in display order (after "Off").
+    pub const FORMATS: [SpatialKind; 6] = [
+        SpatialKind::WindowsSonic,
+        SpatialKind::DolbyAtmosHeadphones,
+        SpatialKind::DolbyAtmosHomeTheater,
+        SpatialKind::DtsHeadphoneX,
+        SpatialKind::DtsXUltra,
+        SpatialKind::DtsXHomeTheater,
+    ];
+
+    /// Localised display name (hard-coded, like the Windows quick settings).
+    pub fn label(self) -> &'static str {
+        use crate::i18n::tr;
+        match self {
+            SpatialKind::Off => tr("Off", "Disattivato"),
+            SpatialKind::WindowsSonic => tr("Windows Sonic for Headphones", "Windows Sonic per cuffie"),
+            SpatialKind::DolbyAtmosHeadphones => tr("Dolby Atmos for Headphones", "Dolby Atmos per cuffie"),
+            SpatialKind::DolbyAtmosHomeTheater => tr("Dolby Atmos for Home Theater", "Dolby Atmos per Home Theater"),
+            SpatialKind::DtsHeadphoneX => "DTS Headphone:X",
+            SpatialKind::DtsXUltra => "DTS:X Ultra",
+            SpatialKind::DtsXHomeTheater => tr("DTS:X for Home Theater", "DTS:X per Home Theater"),
+        }
+    }
+
+    /// Subtype string from `SpatialAudioFormatSubtype` (empty for `Off`).
+    fn subtype(self) -> WinResult<HSTRING> {
+        match self {
+            SpatialKind::Off => Ok(HSTRING::new()),
+            SpatialKind::WindowsSonic => SpatialAudioFormatSubtype::WindowsSonic(),
+            SpatialKind::DolbyAtmosHeadphones => SpatialAudioFormatSubtype::DolbyAtmosForHeadphones(),
+            SpatialKind::DolbyAtmosHomeTheater => SpatialAudioFormatSubtype::DolbyAtmosForHomeTheater(),
+            SpatialKind::DtsHeadphoneX => SpatialAudioFormatSubtype::DTSHeadphoneX(),
+            SpatialKind::DtsXUltra => SpatialAudioFormatSubtype::DTSXUltra(),
+            SpatialKind::DtsXHomeTheater => SpatialAudioFormatSubtype::DTSXForHomeTheater(),
+        }
+    }
+}
+
+/// One selectable spatial format of the default device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpatialOption {
+    pub kind: SpatialKind,
+    /// Subtype passed back to `SetDefaultSpatialAudioFormatAsync` (empty = Off).
+    pub subtype: String,
+}
+
+/// Spatial sound state of the default render device: plain data for the popup, read on demand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpatialState {
+    /// "Off" first, then the supported formats.
+    pub options: Vec<SpatialOption>,
+    /// Index into `options` of the current default format (`None` = an unknown format is set).
+    pub current: Option<usize>,
+}
+
+/// Device interface class of audio render endpoints (`DEVINTERFACE_AUDIO_RENDER`).
+const DEVINTERFACE_AUDIO_RENDER: &str = "{e6327cad-dcec-4949-ae8a-991e976a79d2}";
+
+/// MMDevice endpoint id (`{0.0.0.00000000}.{guid}`) -> WinRT device id
+/// (`\\?\SWD#MMDEVAPI#{0.0.0.00000000}.{guid}#{e6327cad-...}`), the form `MediaDevice` returns.
+pub fn winrt_render_id(mm_id: &str) -> String {
+    format!("\\\\?\\SWD#MMDEVAPI#{}#{DEVINTERFACE_AUDIO_RENDER}", mm_id.trim())
+}
+
+/// Index of `current` (the `DefaultSpatialAudioFormat` value) in `options`, case-insensitive.
+/// An empty value means Off.
+pub fn spatial_index(options: &[SpatialOption], current: &str) -> Option<usize> {
+    let cur = current.trim();
+    if cur.is_empty() {
+        return options.iter().position(|o| o.kind == SpatialKind::Off);
+    }
+    options.iter().position(|o| o.subtype.eq_ignore_ascii_case(cur))
+}
+
+/// Output media subtypes of the audio-encoder MFTs that render the Dolby formats. They are NOT the
+/// `SpatialAudioFormatSubtype` values: these come from the `windows.mediaCodec` declarations of the
+/// Dolby Access package (also listed in the renderer table of `AudioEng.dll`).
+const RENDERER_DOLBY_ATMOS_HEADPHONES: GUID = GUID::from_u128(0x3fe444e2_bda1_4581_a5d4_5f62e8f2ec56);
+const RENDERER_DOLBY_ATMOS_HOME_THEATER: GUID = GUID::from_u128(0xaaca92be_029d_4006_ada0_725b506cf9b2);
+
+/// The other renderer subtypes of the `AudioEng.dll` table (the non-Dolby entries, i.e. the DTS
+/// renderers). Which DTS format each one renders is not documented, so all three DTS formats accept
+/// any of them: the DTS package installs its renderers together.
+static RENDERERS_DTS: [GUID; 8] = [
+    GUID::from_u128(0xdc57ddb4_e086_49ec_b13d_eccdd512990c),
+    GUID::from_u128(0x4565e6cb_d95b_5621_b6af_0e8849c57c80),
+    GUID::from_u128(0xbbba2e14_4720_4f1b_8a70_f506a69010a3),
+    GUID::from_u128(0xaabbaa61_7fc9_4cca_8470_50854517641d),
+    GUID::from_u128(0xe85ab128_a097_4776_bd10_abd3e504745b),
+    GUID::from_u128(0xa26cd299_0c8c_4ea4_a1a8_61e125b7d998),
+    GUID::from_u128(0xfa1d346f_c678_4005_a719_4ca918cc4c45),
+    GUID::from_u128(0xcdc99663_5f31_45ee_89fa_a4a0d64f6d1c),
+];
+
+impl SpatialKind {
+    /// Output subtypes of the MFTs that render this format (empty for `Off` and the built-in
+    /// Windows Sonic).
+    fn renderer_subtypes(self) -> &'static [GUID] {
+        match self {
+            SpatialKind::Off | SpatialKind::WindowsSonic => &[],
+            SpatialKind::DolbyAtmosHeadphones => &[RENDERER_DOLBY_ATMOS_HEADPHONES],
+            SpatialKind::DolbyAtmosHomeTheater => &[RENDERER_DOLBY_ATMOS_HOME_THEATER],
+            SpatialKind::DtsHeadphoneX | SpatialKind::DtsXUltra | SpatialKind::DtsXHomeTheater => &RENDERERS_DTS,
+        }
+    }
+}
+
+/// Whether a spatial format is shown, given `IsSpatialAudioFormatSupported` and the number of
+/// installed renderer MFTs. Windows Sonic is built in (no MFT); every other format needs its
+/// third-party renderer.
+fn spatial_shown(kind: SpatialKind, supported: bool, mft: u32) -> bool {
+    match kind {
+        SpatialKind::Off => true,
+        _ if !supported => false,
+        SpatialKind::WindowsSonic => true,
+        _ => mft > 0,
+    }
+}
+
+/// Media Foundation, loaded dynamically for one spatial read and unloaded on drop, so `mfplat.dll`
+/// never sits in the import table nor stays in the process (it is only needed while the audio popup
+/// reads its spatial formats). Types and GUIDs are defined here for the same reason.
+mod mf {
+    use super::*;
+    use windows::core::w;
+    use windows::Win32::Foundation::{FreeLibrary, HMODULE};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+
+    /// `MFT_CATEGORY_AUDIO_ENCODER`: spatial renderers register here (`windows.mediaCodec`).
+    const MFT_CATEGORY_AUDIO_ENCODER: GUID = GUID::from_u128(0x91c64bd0_f91e_4d8c_9276_db248279d975);
+    /// `MFMediaType_Audio`.
+    const MF_MEDIA_TYPE_AUDIO: GUID = GUID::from_u128(0x73647561_0000_0010_8000_00aa00389b71);
+    /// `MFT_ENUM_FLAG_ALL` (sync, async, hardware, field-of-use, local, transcode-only).
+    const MFT_ENUM_FLAG_ALL: u32 = 0x3f;
+    /// `MFT_ENUM_FLAG_UNTRUSTED_STOREMFT`: also MFTs of Store packages, from a desktop process.
+    const MFT_ENUM_FLAG_UNTRUSTED_STOREMFT: u32 = 0x400;
+    /// `MF_VERSION` (`MF_SDK_VERSION << 16 | MF_API_VERSION`).
+    const MF_VERSION: u32 = 0x0002_0070;
+    /// `MFSTARTUP_LITE`: no sockets.
+    const MFSTARTUP_LITE: u32 = 1;
+
+    /// `MFT_REGISTER_TYPE_INFO`.
+    #[repr(C)]
+    struct TypeInfo {
+        major: GUID,
+        sub: GUID,
+    }
+
+    type StartupFn = unsafe extern "system" fn(u32, u32) -> HRESULT;
+    type ShutdownFn = unsafe extern "system" fn() -> HRESULT;
+    type EnumExFn = unsafe extern "system" fn(
+        GUID,
+        u32,
+        *const TypeInfo,
+        *const TypeInfo,
+        *mut *mut *mut core::ffi::c_void,
+        *mut u32,
+    ) -> HRESULT;
+
+    /// `mfplat.dll` with `MFTEnumEx`, started (lite) for the lifetime of the value.
+    pub struct Probe {
+        lib: HMODULE,
+        enum_ex: EnumExFn,
+        shutdown: Option<ShutdownFn>,
+    }
+
+    impl Probe {
+        /// Loads `mfplat.dll` from System32 and starts Media Foundation. `None` (logged) on failure.
+        pub fn load() -> Option<Probe> {
+            // SAFETY: static wide literal; System32 only (no DLL planting).
+            let lib = match unsafe { LoadLibraryExW(w!("mfplat.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) } {
+                Ok(h) => h,
+                Err(e) => {
+                    log!("audio: LoadLibraryExW(mfplat.dll) failed: {e}");
+                    return None;
+                }
+            };
+            // SAFETY: `lib` is loaded; the names are NUL-terminated literals.
+            let (enum_ex, startup, shutdown) = unsafe {
+                (
+                    GetProcAddress(lib, windows::core::s!("MFTEnumEx")),
+                    GetProcAddress(lib, windows::core::s!("MFStartup")),
+                    GetProcAddress(lib, windows::core::s!("MFShutdown")),
+                )
+            };
+            let Some(enum_ex) = enum_ex else {
+                log!("audio: MFTEnumEx not found in mfplat.dll");
+                // SAFETY: handle from LoadLibraryExW, freed once, no pointer from it kept.
+                let _ = unsafe { FreeLibrary(lib) };
+                return None;
+            };
+            // SAFETY: the exports have exactly these signatures (mfapi.h).
+            let enum_ex: EnumExFn = unsafe { core::mem::transmute(enum_ex) };
+            let mut started = None;
+            if let (Some(st), Some(sd)) = (startup, shutdown) {
+                // SAFETY: same.
+                let (st, sd): (StartupFn, ShutdownFn) = unsafe { (core::mem::transmute(st), core::mem::transmute(sd)) };
+                // SAFETY: plain call; paired with MFShutdown in Drop when it succeeds.
+                let hr = unsafe { st(MF_VERSION, MFSTARTUP_LITE) };
+                if hr.is_ok() {
+                    started = Some(sd);
+                } else {
+                    log!("audio: MFStartup failed: {hr:?}");
+                }
+            }
+            Some(Probe { lib, enum_ex, shutdown: started })
+        }
+
+        /// Number of registered audio-encoder MFTs (Store ones included) whose output subtype is
+        /// `sub`. Every returned `IMFActivate` is released and the array freed. 0 on error (logged).
+        pub fn count(&self, sub: &GUID) -> u32 {
+            let out = TypeInfo { major: MF_MEDIA_TYPE_AUDIO, sub: *sub };
+            let mut arr: *mut *mut core::ffi::c_void = core::ptr::null_mut();
+            let mut n: u32 = 0;
+            // SAFETY: valid pointers for the call; `enum_ex` comes from the still-loaded library.
+            let hr = unsafe {
+                (self.enum_ex)(
+                    MFT_CATEGORY_AUDIO_ENCODER,
+                    MFT_ENUM_FLAG_ALL | MFT_ENUM_FLAG_UNTRUSTED_STOREMFT,
+                    core::ptr::null(),
+                    &out,
+                    &mut arr,
+                    &mut n,
+                )
+            };
+            if !arr.is_null() {
+                for i in 0..n as usize {
+                    // SAFETY: `arr` holds `n` IMFActivate pointers (owned references, may be null).
+                    let p = unsafe { *arr.add(i) };
+                    if !p.is_null() {
+                        // SAFETY: an owned COM reference: wrapping it and dropping releases it once.
+                        drop(unsafe { IUnknown::from_raw(p) });
+                    }
+                }
+                // SAFETY: array allocated by MFTEnumEx with CoTaskMemAlloc, not used afterwards.
+                unsafe { CoTaskMemFree(Some(arr as *const core::ffi::c_void)) };
+            }
+            if hr.is_err() {
+                log!("audio: MFTEnumEx failed: {hr:?}");
+                return 0;
+            }
+            n
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            if let Some(sd) = self.shutdown {
+                // SAFETY: paired with the successful MFStartup in `load`; library still loaded.
+                let _ = unsafe { sd() };
+            }
+            // SAFETY: handle from LoadLibraryExW, freed exactly once; no function pointer from it
+            // outlives `self`.
+            let _ = unsafe { FreeLibrary(self.lib) };
+        }
+    }
+}
+
+/// Reads the spatial sound state of WinRT device `winrt_id`. A format is offered only when Windows
+/// reports it supported AND its renderer is actually installed (`spatial_shown`); Media Foundation is loaded
+/// only for this read. `None` when spatial sound is not supported (or unreadable, logged). The
+/// configuration object is released on return.
+fn read_spatial(winrt_id: &str) -> Option<SpatialState> {
+    let cfg = match SpatialAudioDeviceConfiguration::GetForDeviceId(&HSTRING::from(winrt_id)) {
+        Ok(c) => c,
+        Err(e) => {
+            log!("audio: SpatialAudioDeviceConfiguration::GetForDeviceId failed: {e}");
+            return None;
+        }
+    };
+    if !cfg.IsSpatialAudioSupported().unwrap_or(false) {
+        return None;
+    }
+    let probe = mf::Probe::load();
+    if probe.is_none() {
+        log!("audio: Media Foundation unavailable, only Windows Sonic offered");
+    }
+    let mut options = vec![SpatialOption { kind: SpatialKind::Off, subtype: String::new() }];
+    // The DTS formats share one renderer set: enumerate it once per read.
+    let mut last: Option<(&'static [GUID], u32)> = None;
+    for kind in SpatialKind::FORMATS {
+        let Ok(sub) = kind.subtype() else { continue };
+        let supported = cfg.IsSpatialAudioFormatSupported(&sub).unwrap_or(false);
+        let subs = kind.renderer_subtypes();
+        let mft = match (&probe, last) {
+            (_, Some((s, n))) if supported && core::ptr::eq(s, subs) => n,
+            (Some(p), _) if supported && !subs.is_empty() => {
+                let n = subs.iter().map(|g| p.count(g)).sum();
+                last = Some((subs, n));
+                n
+            }
+            _ => 0,
+        };
+        let shown = spatial_shown(kind, supported, mft);
+        log!("audio: spatial {}: supported={supported} mft={mft} -> shown={shown}", kind.label());
+        if shown {
+            options.push(SpatialOption { kind, subtype: sub.to_string() });
+        }
+    }
+    drop(probe);
+    if options.len() < 2 {
+        return None; // only "Off": nothing to choose
+    }
+    let cur = cfg.DefaultSpatialAudioFormat().map(|h| h.to_string()).unwrap_or_default();
+    let current = spatial_index(&options, &cur);
+    Some(SpatialState { options, current })
+}
+
+/// Starts `SetDefaultSpatialAudioFormatAsync(subtype)` on a short-lived MTA thread (the STA shell
+/// thread never waits for it). When it finishes (logged with its status) the thread posts
+/// `WM_SHELL_SPATIAL_CHANGED` to the shell thread and exits.
+pub fn spawn_set_spatial(winrt_id: String, subtype: String) {
+    let r = std::thread::Builder::new().name("spatial-set".into()).spawn(move || {
+        // SAFETY: COM for this short-lived thread, paired with CoUninitialize below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let res = (|| -> WinResult<SetDefaultSpatialAudioFormatStatus> {
+            let cfg = SpatialAudioDeviceConfiguration::GetForDeviceId(&HSTRING::from(winrt_id.as_str()))?;
+            cfg.SetDefaultSpatialAudioFormatAsync(&HSTRING::from(subtype.as_str()))?.join()?.Status()
+        })();
+        match res {
+            Ok(s) if s == SetDefaultSpatialAudioFormatStatus::Succeeded => {
+                log!("audio: spatial format set to '{subtype}'")
+            }
+            Ok(s) => log!("audio: SetDefaultSpatialAudioFormatAsync('{subtype}') status {}", s.0),
+            Err(e) => log!("audio: SetDefaultSpatialAudioFormatAsync('{subtype}') failed: {e}"),
+        }
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above; all WinRT objects are dropped.
+            unsafe { CoUninitialize() };
+        }
+        let tid = crate::shell_thread::thread_id();
+        if tid != 0 {
+            // SAFETY: PostThreadMessageW is thread-safe; it only fails if the thread no longer exists.
+            let _ = unsafe { PostThreadMessageW(tid, WM_SHELL_SPATIAL_CHANGED, WPARAM(0), LPARAM(0)) };
+        }
+    });
+    if let Err(e) = r {
+        log!("audio: spawn spatial-set thread failed: {e}");
+    }
+}
+
+// ------------------------------------------------- per-app sessions (volume mixer)
+
+/// Maximum number of mixer rows.
+pub const MAX_SESSIONS: usize = 8;
+
+/// One mixer row: all the sessions of one process on the default device (or the system sounds).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppSession {
+    pub pid: u32,
+    /// The "System sounds" session (shown last, with a localised name).
+    pub system: bool,
+    pub name: String,
+    /// Highest level among the process sessions, 0..=100.
+    pub level: u8,
+    /// true only if all the process sessions are muted.
+    pub muted: bool,
+}
+
+/// One live session as read from WASAPI (before grouping).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawSession {
+    pub pid: u32,
+    pub system: bool,
+    pub level: u8,
+    pub muted: bool,
+    /// `GetDisplayName`, when usable (not empty, not an `@` resource string).
+    pub display: Option<String>,
+}
+
+/// Groups `raw` by process (system sounds apart), keeps the enumeration order, puts the system
+/// sounds last and caps the result at `MAX_SESSIONS` rows. `name` is left empty when no session of
+/// the group had a usable display name (the caller resolves it from the exe).
+pub fn group_sessions(raw: &[RawSession]) -> Vec<AppSession> {
+    let mut apps: Vec<AppSession> = Vec::new();
+    let mut system: Option<AppSession> = None;
+    for r in raw {
+        let slot = if r.system {
+            system.get_or_insert_with(|| AppSession {
+                pid: r.pid,
+                system: true,
+                name: String::new(),
+                level: 0,
+                muted: true,
+            })
+        } else {
+            match apps.iter().position(|a| a.pid == r.pid) {
+                Some(i) => &mut apps[i],
+                None => {
+                    apps.push(AppSession { pid: r.pid, system: false, name: String::new(), level: 0, muted: true });
+                    apps.last_mut().expect("just pushed")
+                }
+            }
+        };
+        slot.level = slot.level.max(r.level.min(100));
+        slot.muted &= r.muted;
+        if slot.name.is_empty() {
+            if let Some(d) = r.display.as_deref() {
+                slot.name = d.to_string();
+            }
+        }
+    }
+    let cap = MAX_SESSIONS - usize::from(system.is_some());
+    apps.truncate(cap);
+    apps.extend(system);
+    apps
+}
+
+/// true if a session belongs to the mixer row `(pid, system)`.
+fn session_matches(pid: u32, system: bool, r_pid: u32, r_system: bool) -> bool {
+    if system {
+        r_system
+    } else {
+        !r_system && r_pid == pid
+    }
+}
+
+/// `GetDisplayName` if usable: not empty and not an `@dll,-id` resource reference.
+fn usable_display_name(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() || t.starts_with('@') {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 // ------------------------------------------------- IPolicyConfig (undocumented)
@@ -196,17 +693,22 @@ fn friendly_name(dev: &IMMDevice) -> Option<String> {
     name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// Form factor of the endpoint (`PKEY_AudioEndpoint_FormFactor`, VT_UI4); `Speaker` if unreadable.
-fn device_kind(dev: &IMMDevice) -> DeviceKind {
+/// Raw `EndpointFormFactor` of the endpoint (`PKEY_AudioEndpoint_FormFactor`, VT_UI4), if readable.
+fn form_factor(dev: &IMMDevice) -> Option<u32> {
     // SAFETY: `dev` is valid.
-    let Ok(store) = (unsafe { dev.OpenPropertyStore(STGM_READ) }) else { return DeviceKind::Speaker };
+    let store = unsafe { dev.OpenPropertyStore(STGM_READ) }.ok()?;
     // SAFETY: `store` is valid, key is valid.
-    let Ok(mut pv) = (unsafe { store.GetValue(&PKEY_AudioEndpoint_FormFactor) }) else { return DeviceKind::Speaker };
+    let mut pv = unsafe { store.GetValue(&PKEY_AudioEndpoint_FormFactor) }.ok()?;
     // SAFETY: `pv` is a PROPVARIANT initialized by GetValue (conversion fails on VT_EMPTY, handled).
-    let kind = unsafe { PropVariantToUInt32(&pv) }.map(DeviceKind::from_form_factor).unwrap_or(DeviceKind::Speaker);
+    let v = unsafe { PropVariantToUInt32(&pv) }.ok();
     // SAFETY: `pv` belongs to us and is no longer used.
     let _ = unsafe { PropVariantClear(&mut pv) };
-    kind
+    v
+}
+
+/// Kind of the endpoint from its form factor; `Speaker` if unreadable.
+fn device_kind(dev: &IMMDevice) -> DeviceKind {
+    form_factor(dev).map_or(DeviceKind::Speaker, DeviceKind::from_form_factor)
 }
 
 // ------------------------------------------------- COM callbacks (arbitrary threads)
@@ -482,6 +984,139 @@ impl AudioController {
         Ok(())
     }
 
+    /// Default render device (`eRender`, `eConsole`), `None` if there is none.
+    fn default_device(&self) -> Option<IMMDevice> {
+        // SAFETY: `enumerator` is valid, owned by the controller (shell thread, COM STA).
+        unsafe { self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.ok()
+    }
+
+    /// WinRT device id of the default render device (for `SpatialAudioDeviceConfiguration`).
+    pub fn default_winrt_id(&self) -> Option<String> {
+        self.default_device().and_then(|d| device_id(&d)).map(|id| winrt_render_id(&id))
+    }
+
+    /// Spatial sound state of the default device, read now (nothing kept). `None` = not supported.
+    pub fn spatial(&self) -> Option<SpatialState> {
+        let dev = self.default_device()?;
+        let id = winrt_render_id(&device_id(&dev)?);
+        read_spatial(&id)
+    }
+
+    /// Calls `f(volume, pid, system)` for every non-expired session of the default device. Every
+    /// session COM object is released when this returns.
+    fn for_each_session(&self, mut f: impl FnMut(&IAudioSessionControl2, &ISimpleAudioVolume, u32, bool)) {
+        let Some(dev) = self.default_device() else { return };
+        // SAFETY: `dev` is valid; Activate with IAudioSessionManager2, no activation parameter.
+        let mgr: IAudioSessionManager2 = match unsafe { dev.Activate(CLSCTX_ALL, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                log!("audio: Activate(IAudioSessionManager2) failed: {e}");
+                return;
+            }
+        };
+        // SAFETY: `mgr` is valid.
+        let sessions = match unsafe { mgr.GetSessionEnumerator() } {
+            Ok(s) => s,
+            Err(e) => {
+                log!("audio: GetSessionEnumerator failed: {e}");
+                return;
+            }
+        };
+        // SAFETY: `sessions` is valid.
+        let n = unsafe { sessions.GetCount() }.unwrap_or(0);
+        for i in 0..n {
+            // SAFETY: `i < n`, `sessions` is valid.
+            let Ok(ctl) = (unsafe { sessions.GetSession(i) }) else { continue };
+            // SAFETY: `ctl` is valid.
+            if unsafe { ctl.GetState() }.map_or(true, |s| s == AudioSessionStateExpired) {
+                continue;
+            }
+            let (Ok(c2), Ok(vol)) = (ctl.cast::<IAudioSessionControl2>(), ctl.cast::<ISimpleAudioVolume>()) else {
+                continue;
+            };
+            // SAFETY: `c2` is valid; S_OK = system sounds, S_FALSE = not.
+            let system = unsafe { c2.IsSystemSoundsSession() } == HRESULT(0);
+            // SAFETY: same. Cross-process sessions report a success code and pid 0 or the creator.
+            let pid = unsafe { c2.GetProcessId() }.unwrap_or(0);
+            f(&c2, &vol, pid, system);
+        }
+    }
+
+    /// Live sessions of the default device (not grouped, names not resolved).
+    pub fn list_sessions(&self) -> Vec<RawSession> {
+        let mut out = Vec::new();
+        self.for_each_session(|c2, vol, pid, system| {
+            // SAFETY: `vol` is valid for the callback.
+            let level = unsafe { vol.GetMasterVolume() }.map(|l| (l.clamp(0.0, 1.0) * 100.0).round() as u8);
+            // SAFETY: same.
+            let muted = unsafe { vol.GetMute() }.map(|m| m.as_bool());
+            let (Ok(level), Ok(muted)) = (level, muted) else { return };
+            let display = if system {
+                None
+            } else {
+                // SAFETY: `c2` is valid; the returned string is freed below.
+                match unsafe { c2.GetDisplayName() } {
+                    Ok(p) if !p.is_null() => {
+                        // SAFETY: NUL-terminated wide string allocated by COM, read once then freed.
+                        let s = unsafe { p.to_string() }.ok();
+                        // SAFETY: same pointer, not used anymore.
+                        unsafe { CoTaskMemFree(Some(p.0 as *const core::ffi::c_void)) };
+                        s.as_deref().and_then(usable_display_name)
+                    }
+                    _ => None,
+                }
+            };
+            out.push(RawSession { pid, system, level, muted, display });
+        });
+        out
+    }
+
+    /// Sets the level (0..=100) of every session of mixer row `(pid, system)`; a level > 0 also
+    /// clears their mute (like the master slider).
+    pub fn set_session_volume(&self, pid: u32, system: bool, level: u8) {
+        let v = level.min(100) as f32 / 100.0;
+        self.for_each_session(|_, vol, p, s| {
+            if !session_matches(pid, system, p, s) {
+                return;
+            }
+            // SAFETY: `vol` is valid; the context GUID lives for the whole call.
+            if let Err(e) = unsafe { vol.SetMasterVolume(v, &MY_CONTEXT) } {
+                log!("audio: session SetMasterVolume failed: {e}");
+            }
+            // SAFETY: same.
+            if level > 0 && unsafe { vol.GetMute() }.is_ok_and(|m| m.as_bool()) {
+                // SAFETY: same.
+                let _ = unsafe { vol.SetMute(false, &MY_CONTEXT) };
+            }
+        });
+    }
+
+    /// Toggles the mute of mixer row `(pid, system)`: all its sessions are unmuted if they were all
+    /// muted, muted otherwise.
+    pub fn toggle_session_mute(&self, pid: u32, system: bool) {
+        let mut all_muted = true;
+        let mut any = false;
+        self.for_each_session(|_, vol, p, s| {
+            if session_matches(pid, system, p, s) {
+                any = true;
+                // SAFETY: `vol` is valid for the callback.
+                all_muted &= unsafe { vol.GetMute() }.is_ok_and(|m| m.as_bool());
+            }
+        });
+        if !any {
+            return;
+        }
+        let target = !all_muted;
+        self.for_each_session(|_, vol, p, s| {
+            if session_matches(pid, system, p, s) {
+                // SAFETY: `vol` is valid; the context GUID lives for the whole call.
+                if let Err(e) = unsafe { vol.SetMute(target, &MY_CONTEXT) } {
+                    log!("audio: session SetMute failed: {e}");
+                }
+            }
+        });
+    }
+
     /// Default device changed: releases the callback on the old endpoint, opens the
     /// new one, registers the callback and re-reads the state. Returns the new state.
     pub fn reopen_endpoint(&mut self) -> VolumeState {
@@ -524,4 +1159,122 @@ pub fn decode_volume_msg(wparam: usize, lparam: isize) -> VolumeState {
         return VolumeState::default();
     }
     VolumeState { level: wparam.min(100) as u8, muted: lparam != 0, available: true }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mmdevice_id_to_winrt() {
+        let mm = "{0.0.0.00000000}.{8a5c1f0e-1234-4b2a-9c3d-0123456789ab}";
+        assert_eq!(
+            winrt_render_id(mm),
+            "\\\\?\\SWD#MMDEVAPI#{0.0.0.00000000}.{8a5c1f0e-1234-4b2a-9c3d-0123456789ab}\
+             #{e6327cad-dcec-4949-ae8a-991e976a79d2}"
+        );
+        assert_eq!(winrt_render_id(&format!(" {mm} ")), winrt_render_id(mm));
+    }
+
+    #[test]
+    fn spatial_labels() {
+        // Tests never switch the language: English.
+        assert_eq!(SpatialKind::Off.label(), "Off");
+        assert_eq!(SpatialKind::WindowsSonic.label(), "Windows Sonic for Headphones");
+        assert_eq!(SpatialKind::DolbyAtmosHeadphones.label(), "Dolby Atmos for Headphones");
+        assert_eq!(SpatialKind::DolbyAtmosHomeTheater.label(), "Dolby Atmos for Home Theater");
+        assert_eq!(SpatialKind::DtsHeadphoneX.label(), "DTS Headphone:X");
+        assert_eq!(SpatialKind::DtsXUltra.label(), "DTS:X Ultra");
+        assert_eq!(SpatialKind::DtsXHomeTheater.label(), "DTS:X for Home Theater");
+        assert!(!SpatialKind::FORMATS.contains(&SpatialKind::Off));
+    }
+
+    #[test]
+    fn spatial_current_case_insensitive() {
+        let opts = vec![
+            SpatialOption { kind: SpatialKind::Off, subtype: String::new() },
+            SpatialOption { kind: SpatialKind::WindowsSonic, subtype: "{B53EF6E2-0000-ABCD-ef01-AA}".into() },
+            SpatialOption { kind: SpatialKind::DtsXUltra, subtype: "{dd0123}".into() },
+        ];
+        assert_eq!(spatial_index(&opts, ""), Some(0));
+        assert_eq!(spatial_index(&opts, "  "), Some(0));
+        assert_eq!(spatial_index(&opts, "{b53ef6e2-0000-abcd-EF01-aa}"), Some(1));
+        assert_eq!(spatial_index(&opts, "{DD0123}"), Some(2));
+        assert_eq!(spatial_index(&opts, "{other}"), None);
+    }
+
+    #[test]
+    fn renderer_subtypes_per_format() {
+        use SpatialKind::*;
+        assert!(Off.renderer_subtypes().is_empty());
+        assert!(WindowsSonic.renderer_subtypes().is_empty());
+        assert_eq!(DolbyAtmosHeadphones.renderer_subtypes(), &[RENDERER_DOLBY_ATMOS_HEADPHONES]);
+        assert_eq!(DolbyAtmosHomeTheater.renderer_subtypes(), &[RENDERER_DOLBY_ATMOS_HOME_THEATER]);
+        // The three DTS formats share the same set (enumerated once per read).
+        assert!(core::ptr::eq(DtsHeadphoneX.renderer_subtypes(), DtsXUltra.renderer_subtypes()));
+        assert!(core::ptr::eq(DtsXUltra.renderer_subtypes(), DtsXHomeTheater.renderer_subtypes()));
+        // No Dolby renderer in the DTS set.
+        for g in [RENDERER_DOLBY_ATMOS_HEADPHONES, RENDERER_DOLBY_ATMOS_HOME_THEATER] {
+            assert!(!RENDERERS_DTS.contains(&g));
+        }
+    }
+
+    #[test]
+    fn spatial_shown_rules() {
+        use SpatialKind::*;
+        assert!(spatial_shown(WindowsSonic, true, 0));
+        assert!(!spatial_shown(WindowsSonic, false, 0));
+        assert!(spatial_shown(DolbyAtmosHeadphones, true, 1));
+        assert!(!spatial_shown(DolbyAtmosHeadphones, true, 0));
+        assert!(!spatial_shown(DolbyAtmosHeadphones, false, 1));
+        assert!(!spatial_shown(DtsHeadphoneX, true, 0));
+        assert!(spatial_shown(DtsXUltra, true, 2));
+    }
+
+    fn raw(pid: u32, system: bool, level: u8, muted: bool, display: Option<&str>) -> RawSession {
+        RawSession { pid, system, level, muted, display: display.map(str::to_string) }
+    }
+
+    #[test]
+    fn sessions_grouped_by_process_system_last() {
+        let list = vec![
+            raw(0, true, 50, false, None),
+            raw(10, false, 30, true, None),
+            raw(20, false, 80, false, Some("Player")),
+            raw(10, false, 70, false, Some("Browser")),
+            raw(20, false, 10, true, None),
+        ];
+        let g = group_sessions(&list);
+        assert_eq!(g.len(), 3);
+        assert_eq!((g[0].pid, g[0].level, g[0].muted, g[0].name.as_str()), (10, 70, false, "Browser"));
+        assert_eq!((g[1].pid, g[1].level, g[1].muted, g[1].name.as_str()), (20, 80, false, "Player"));
+        assert!(g[2].system);
+        let all_muted = group_sessions(&[raw(5, false, 40, true, None), raw(5, false, 60, true, None)]);
+        assert!(all_muted[0].muted);
+        assert_eq!(all_muted[0].level, 60);
+    }
+
+    #[test]
+    fn sessions_capped_keeping_system() {
+        let mut list: Vec<RawSession> = (1..=12).map(|p| raw(p, false, 50, false, None)).collect();
+        list.push(raw(0, true, 50, false, None));
+        let g = group_sessions(&list);
+        assert_eq!(g.len(), MAX_SESSIONS);
+        assert!(g.last().unwrap().system);
+        assert_eq!(g[0].pid, 1);
+        let only_apps: Vec<RawSession> = (1..=12).map(|p| raw(p, false, 50, false, None)).collect();
+        assert_eq!(group_sessions(&only_apps).len(), MAX_SESSIONS);
+    }
+
+    #[test]
+    fn session_row_matching_and_names() {
+        assert!(session_matches(7, false, 7, false));
+        assert!(!session_matches(7, false, 7, true));
+        assert!(!session_matches(7, false, 8, false));
+        assert!(session_matches(0, true, 1234, true));
+        assert!(!session_matches(0, true, 0, false));
+        assert_eq!(usable_display_name("@%SystemRoot%\\System32\\AudioSrv.Dll,-202"), None);
+        assert_eq!(usable_display_name("  "), None);
+        assert_eq!(usable_display_name(" Spotify "), Some("Spotify".to_string()));
+    }
 }

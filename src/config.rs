@@ -18,6 +18,60 @@ use serde::{Deserialize, Serialize};
 /// under the mouse pointer (Settings -> Screen -> "Pointer").
 pub const MONITOR_POINTER: &str = "pointer";
 
+/// Language of the dock's own texts (`i18n`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    /// The Windows display language (Italian when it is Italian, English otherwise).
+    #[default]
+    Auto,
+    En,
+    It,
+}
+
+/// Layout of the dock's own Start menu (`popup_startmenu`). Written as "vertical" / "horizontal";
+/// an unknown value falls back to vertical instead of rejecting the whole file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StartStyle {
+    /// Search, two rows of pins and the alphabetical list in one column (the original menu).
+    #[default]
+    Vertical,
+    /// Windows 11 organization: pages of pinned tiles, "All apps" on its own page, user and power bar.
+    Horizontal,
+}
+
+impl StartStyle {
+    /// The config value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartStyle::Vertical => "vertical",
+            StartStyle::Horizontal => "horizontal",
+        }
+    }
+
+    /// Parses the config value (any case); anything else is `Vertical`.
+    pub fn parse(s: &str) -> StartStyle {
+        if s.trim().eq_ignore_ascii_case("horizontal") {
+            StartStyle::Horizontal
+        } else {
+            StartStyle::Vertical
+        }
+    }
+}
+
+impl Serialize for StartStyle {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for StartStyle {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(StartStyle::parse(&s))
+    }
+}
+
 /// Position of the bar.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +173,164 @@ pub const BACKGROUND_PRESETS: [(&str, Background); 7] = [
     ("Forest", Background(0x10261B)),
 ];
 
+// ------------------------------------------------------------- audio popup layout
+
+/// Sections of the audio popup (`popup_audio`), as stored in `AudioLayout`: master volume.
+pub const AUDIO_MASTER: u8 = 0;
+/// Output devices.
+pub const AUDIO_OUTPUT: u8 = 1;
+/// Spatial sound formats.
+pub const AUDIO_SPATIAL: u8 = 2;
+/// Per-app volume mixer.
+pub const AUDIO_MIXER: u8 = 3;
+/// Number of sections.
+const AUDIO_SECTIONS: u8 = 4;
+/// Letter of each section in the config string (index = section).
+const AUDIO_LETTERS: [char; 4] = ['m', 'o', 's', 'x'];
+
+/// Layout of the audio popup: order, expanded / collapsed and hidden sections. 6 bytes in memory,
+/// a short string in the file (`encode` / `parse`): one letter per section in display order
+/// (M master, O output, S spatial, X mixer), upper case = expanded, lower case = collapsed, a
+/// leading `-` = hidden. Default `"MOSX"`.
+///
+/// Invariant (kept by every method): `order` holds each section exactly once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioLayout {
+    /// Display order of the sections.
+    order: [u8; 4],
+    /// Bit `section` set = expanded.
+    open: u8,
+    /// Bit `section` set = hidden.
+    hidden: u8,
+}
+
+impl Default for AudioLayout {
+    /// The original popup: all four sections visible and expanded.
+    fn default() -> Self {
+        AudioLayout { order: [AUDIO_MASTER, AUDIO_OUTPUT, AUDIO_SPATIAL, AUDIO_MIXER], open: 0x0F, hidden: 0 }
+    }
+}
+
+impl AudioLayout {
+    /// Sections in display order.
+    pub fn order(&self) -> &[u8] {
+        &self.order
+    }
+
+    /// Section expanded.
+    pub fn is_open(&self, section: u8) -> bool {
+        section < AUDIO_SECTIONS && self.open & (1 << section) != 0
+    }
+
+    pub fn is_hidden(&self, section: u8) -> bool {
+        section < AUDIO_SECTIONS && self.hidden & (1 << section) != 0
+    }
+
+    /// Expands / collapses a section.
+    pub fn toggle_open(&mut self, section: u8) {
+        if section < AUDIO_SECTIONS {
+            self.open ^= 1 << section;
+        }
+    }
+
+    /// Shows / hides a section.
+    pub fn toggle_hidden(&mut self, section: u8) {
+        if section < AUDIO_SECTIONS {
+            self.hidden ^= 1 << section;
+        }
+    }
+
+    /// true if `section` is on screen with its content: visible and expanded. Only then does the
+    /// popup read its data from Windows.
+    pub fn loadable(&self, section: u8) -> bool {
+        section < AUDIO_SECTIONS && !self.is_hidden(section) && self.is_open(section)
+    }
+
+    /// Moves `section` so that it ends up at position `index` of the order (clamped to the last
+    /// one); the others keep their relative order. false if nothing changed.
+    pub fn move_to(&mut self, section: u8, index: usize) -> bool {
+        let Some(from) = self.order.iter().position(|&v| v == section) else { return false };
+        let to = index.min(self.order.len() - 1);
+        if from == to {
+            return false;
+        }
+        if from < to {
+            self.order[from..=to].rotate_left(1);
+        } else {
+            self.order[to..=from].rotate_right(1);
+        }
+        true
+    }
+
+    /// The config string (see the type doc), e.g. `"MOSX"` or `"M-oSX"`.
+    pub fn encode(&self) -> String {
+        let mut out = String::with_capacity(8);
+        for &s in &self.order {
+            if self.is_hidden(s) {
+                out.push('-');
+            }
+            let c = AUDIO_LETTERS[s as usize];
+            out.push(if self.is_open(s) { c.to_ascii_uppercase() } else { c });
+        }
+        out
+    }
+
+    /// Parses the config string. Tolerant: unknown characters and repeated sections are ignored,
+    /// missing sections come back at the end, visible and expanded. Never fails. A string saved by
+    /// an older version with the "More" group (`G(...)` / `g(...)`) is flattened: the grouped
+    /// sections take the group's place, with their own flags (the group's flag is dropped).
+    pub fn parse(text: &str) -> AudioLayout {
+        let mut l = AudioLayout { order: [0; 4], open: 0, hidden: 0 };
+        let mut n = 0;
+        let mut seen = 0u8;
+        let mut hide = false;
+        for c in text.chars() {
+            match c {
+                '-' => hide = true,
+                // Old group syntax: the marker and its brackets are dropped, a stray '-' with them.
+                'g' | 'G' | '(' | ')' => hide = false,
+                _ => {
+                    let Some(s) = AUDIO_LETTERS.iter().position(|&x| x == c.to_ascii_lowercase()) else { continue };
+                    let s = s as u8;
+                    if seen & (1 << s) == 0 {
+                        seen |= 1 << s;
+                        if c.is_ascii_uppercase() {
+                            l.open |= 1 << s;
+                        }
+                        if hide {
+                            l.hidden |= 1 << s;
+                        }
+                        l.order[n] = s;
+                        n += 1;
+                    }
+                    hide = false;
+                }
+            }
+        }
+        for s in 0..AUDIO_SECTIONS {
+            if seen & (1 << s) == 0 {
+                l.open |= 1 << s;
+                l.order[n] = s;
+                n += 1;
+            }
+        }
+        l
+    }
+}
+
+impl Serialize for AudioLayout {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.encode())
+    }
+}
+
+impl<'de> Deserialize<'de> for AudioLayout {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(AudioLayout::parse(&s))
+    }
+}
+
 /// Range of a size setting: `min..=max`; `default` reproduces the original look.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SizeRange {
@@ -164,6 +376,8 @@ pub struct PinnedApp {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
+    /// Language of the dock: "auto" (Windows display language), "en" or "it" (`i18n`).
+    pub language: Language,
     pub position: Position,
     /// Display the bar sits on: empty = the primary monitor (default), otherwise a GDI device name
     /// such as "\\.\DISPLAY2". A display that is not connected falls back to the primary one.
@@ -173,11 +387,17 @@ pub struct Config {
     /// Window picker with live DWM thumbnails when the pointer rests on an app with 2+ windows
     /// (`picker`). false = no hover timer is armed and no picker window is ever created.
     pub window_previews: bool,
+    /// Every Win tap opens / closes the Start menu together with the bar, as one show/hide
+    /// animation (`ui::start_with_bar`). false = the original behaviour: Win toggles the bar,
+    /// double tap = Start.
+    pub win_opens_start: bool,
     pub hide_native_taskbar: bool,
     pub pinned: Vec<PinnedApp>,
     /// Apps pinned at the top of the Start menu opened by the Win double tap (`popup_startmenu`),
     /// in order: AppsFolder ids (`shell_thread::StartApp::id`). Separate from the bar's `pinned`.
     pub start_pins: Vec<String>,
+    /// Layout of that Start menu: "vertical" (default) or "horizontal" (`StartStyle`).
+    pub start_style: StartStyle,
     /// Name overrides: key = lowercase exe file name (e.g. "code.exe") or AUMID;
     /// value = name to show.
     pub names: BTreeMap<String, String>,
@@ -237,6 +457,9 @@ pub struct Config {
     /// "show_desktop", "power". Validated on use (`render::modules_from_names`): unknown names are
     /// ignored, a missing module goes back next to its default neighbour.
     pub modules_order: Vec<String>,
+    /// Layout of the volume popup (`AudioLayout`): section order, expanded / collapsed and hidden.
+    /// Written as a short string, e.g. "MOSX" (the default).
+    pub audio_layout: AudioLayout,
     /// true once the `notif` thread has already asked for notification access once
     /// (`RequestAccessAsync`): the prompt is not shown again on every start.
     pub notif_prompted: bool,
@@ -263,13 +486,16 @@ pub const DEFAULT_TRAY_HIDDEN_GUIDS: [&str; 5] = [
 impl Default for Config {
     fn default() -> Self {
         Config {
+            language: Language::Auto,
             position: Position::Bottom,
             monitor: String::new(),
             autohide: true,
             window_previews: true,
+            win_opens_start: false,
             hide_native_taskbar: true,
             pinned: Vec::new(),
             start_pins: Vec::new(),
+            start_style: StartStyle::Vertical,
             names: BTreeMap::new(),
             show_date: true,
             show_volume_percent: true,
@@ -297,6 +523,7 @@ impl Default for Config {
             app_order: Vec::new(),
             tray_order: Vec::new(),
             modules_order: DEFAULT_MODULES_ORDER.iter().map(|s| s.to_string()).collect(),
+            audio_layout: AudioLayout::default(),
             notif_prompted: false,
         }
     }
@@ -320,6 +547,8 @@ pub fn get() -> Arc<Config> {
 }
 
 pub(crate) fn set(c: Config) {
+    // Every path that changes the config ends here: the dock language follows it.
+    crate::i18n::apply(c.language);
     let new = Arc::new(c);
     match cell().lock() {
         Ok(mut g) => *g = new,
@@ -455,6 +684,11 @@ fn render(c: &Config) -> String {
         Position::Bottom => "bottom",
     };
     let bg = c.background.hex();
+    let lang = match c.language {
+        Language::Auto => "auto",
+        Language::En => "en",
+        Language::It => "it",
+    };
     format!(
         r#"{TEMPLATE_MARK}
 // Edit and save: changes are picked up within ~2 seconds, no restart needed.
@@ -464,6 +698,10 @@ fn render(c: &Config) -> String {
 // settings are kept; if the dock must save a change (pin, tray icon) before you fix it,
 // your file is first copied to config.json.bak so no edit is lost.
 {{
+  // Language of the dock: "auto" (follows the Windows display language), "en" or "it".
+  // Also sets the language of the clock, date and calendar names. Normally chosen in Settings.
+  "language": "{lang}",
+
   // Where the bar sits on screen: "top" or "bottom".
   "position": "{pos}",
 
@@ -504,13 +742,22 @@ fn render(c: &Config) -> String {
   // title); click a preview to switch to that window. false = no previews and no extra window.
   "window_previews": {window_previews},
 
+  // true = the Win key opens the Start menu together with the bar and the next tap closes both
+  // (one animation). false = the Win key shows / hides the bar and a double tap opens the Start menu.
+  "win_opens_start": {win_opens_start},
+
+  // Layout of the dock's Start menu: "vertical" (search, pinned apps and the list of all apps in one
+  // column) or "horizontal" (Windows 11 style: pages of pinned apps, "All apps" on its own page,
+  // user name and power button at the bottom). Normally chosen in Settings. Other values = "vertical".
+  "start_style": "{start_style}",
+
   // Hide Windows' own taskbar while the dock runs (restored when the dock exits).
   "hide_native_taskbar": {hide_native},
 
   // Show the date next to the clock.
   "show_date": {show_date},
 
-  // Clock format (Windows time picture, uses your system locale).
+  // Clock format (Windows time picture, uses the dock language, or your system locale with "auto").
   //   H / HH = hour 0-23      h / hh = hour 1-12      m / mm = minutes
   //   s / ss = seconds        t / tt = AM/PM marker
   // Examples: "HH:mm" -> 14:05 (24h)    "h:mm tt" -> 2:05 PM (12h)
@@ -593,6 +840,15 @@ fn render(c: &Config) -> String {
   // Hiding a module (the show_* switches above) keeps its place in this list.
   "modules_order": {modules_order},
 
+  // Volume panel layout. Normally changed in the panel itself: click a section title to expand or
+  // collapse it, or use the pencil button at the bottom (Customize) to drag sections into a new
+  // order and to hide them. One letter per section, in display order: M = master volume,
+  // O = output devices, S = spatial sound, X = volume mixer. Upper case = expanded, lower case =
+  // collapsed, a leading "-" hides the section. Missing sections come back at the end.
+  // Example: "M-OsX". Default: "MOSX".
+  // A collapsed or hidden section reads nothing from Windows.
+  "audio_layout": {audio_layout},
+
   // Display-name overrides. Key = exe file name lowercase (e.g. "code.exe") or AUMID;
   // value = the name to show. Example: {{ "code.exe": "VS Code" }}
   "names": {names},
@@ -609,6 +865,8 @@ fn render(c: &Config) -> String {
         module_size = c.module_size,
         autohide = c.autohide,
         window_previews = c.window_previews,
+        win_opens_start = c.win_opens_start,
+        start_style = c.start_style.as_str(),
         hide_native = c.hide_native_taskbar,
         show_date = c.show_date,
         time_format = js(&c.time_format),
@@ -627,6 +885,7 @@ fn render(c: &Config) -> String {
         tray_order = js_block(&c.tray_order),
         app_order = js_block(&c.app_order),
         modules_order = js_block(&c.modules_order),
+        audio_layout = js(&c.audio_layout.encode()),
         tray_guids = js_block(&c.tray_hidden_guids),
         pinned = js_block(&c.pinned),
         start_pins = js_block(&c.start_pins),
@@ -1038,8 +1297,12 @@ mod tests {
         c.background = Background(0x2E1119);
         c.bar_opacity = 0;
         c.window_previews = false;
+        c.win_opens_start = true;
+        c.language = Language::It;
         let r = render(&c);
         assert!(r.contains("\"window_previews\": false"));
+        assert!(r.contains("\"win_opens_start\": true"));
+        assert!(r.contains("\"language\": \"it\""));
         assert!(r.contains("Get-StartApps") && r.contains("\"background\": \"#2E1119\""));
         assert!(!r.contains("\"bar_size\":"));
         assert_eq!(parse(&r).unwrap(), c);
@@ -1108,6 +1371,26 @@ mod tests {
     }
 
     #[test]
+    fn start_style_roundtrip_and_fallback() {
+        assert_eq!(Config::default().start_style, StartStyle::Vertical);
+        let r = render(&Config::default());
+        assert!(r.contains("\"start_style\": \"vertical\""));
+        let mut c = Config::default();
+        c.start_style = StartStyle::Horizontal;
+        let r = render(&c);
+        assert!(r.contains("\"start_style\": \"horizontal\""));
+        assert_eq!(parse(&r).unwrap(), c);
+        assert_eq!(parse(&serde_json::to_string(&c).unwrap()).unwrap(), c);
+        // Any case is read; unknown values fall back to vertical without rejecting the file.
+        assert_eq!(parse("{\"start_style\": \"Horizontal\"}").unwrap().start_style, StartStyle::Horizontal);
+        let odd = parse("{\"start_style\": \"diagonal\", \"autohide\": false}").unwrap();
+        assert_eq!(odd.start_style, StartStyle::Vertical);
+        assert!(!odd.autohide);
+        // An old config without the key gets the original menu.
+        assert_eq!(parse("{}").unwrap().start_style, StartStyle::Vertical);
+    }
+
+    #[test]
     fn bar_alpha_is_clamped() {
         let mut c = Config::default();
         assert_eq!(c.bar_alpha(), 242);
@@ -1150,6 +1433,83 @@ mod tests {
         assert_eq!(parse("{\"bar_size\": \"large\", \"app_icon_size\": 30}").unwrap().sizes(), (30, 13, 16, 100));
         // Out-of-range values are clamped on use.
         assert_eq!(parse("{\"app_icon_size\": 200, \"module_size\": 5}").unwrap().sizes(), (32, 13, 16, 75));
+    }
+
+    #[test]
+    fn audio_layout_default_and_serialization() {
+        // Default: the original popup, written as "MOSX"; an old config without the key gets it.
+        let d = AudioLayout::default();
+        assert_eq!(d.encode(), "MOSX");
+        assert_eq!(d.order(), &[AUDIO_MASTER, AUDIO_OUTPUT, AUDIO_SPATIAL, AUDIO_MIXER]);
+        assert!((0..4).all(|s| d.is_open(s) && !d.is_hidden(s) && d.loadable(s)));
+        assert_eq!(parse("{\"show_tray\": false}").unwrap().audio_layout, d);
+        assert_eq!(AudioLayout::parse(""), d);
+        assert_eq!(AudioLayout::parse("MOSX"), d);
+        assert_eq!(std::mem::size_of::<AudioLayout>(), 6);
+        // Collapsed and hidden sections round-trip through the template.
+        let mut c = Config::default();
+        c.audio_layout = AudioLayout::parse("M-oXS");
+        assert_eq!(c.audio_layout.encode(), "M-oXS");
+        assert!(c.audio_layout.is_hidden(AUDIO_OUTPUT) && !c.audio_layout.is_open(AUDIO_OUTPUT));
+        let r = render(&c);
+        assert!(r.contains("\"audio_layout\": \"M-oXS\""));
+        assert_eq!(parse(&r).unwrap(), c);
+        // Tolerant parse: junk and repeats ignored, missing sections appended.
+        assert_eq!(AudioLayout::parse("x, m ?? X").encode(), "xmOS");
+        assert_eq!(AudioLayout::parse("so").encode(), "soMX");
+        // A value of the wrong type still rejects the file like any other field.
+        assert!(parse("{\"audio_layout\": 5}").is_err());
+    }
+
+    #[test]
+    fn audio_layout_old_group_strings_are_flattened() {
+        // The grouped sections take the group's place with their own flags; the group's own flag
+        // (G expanded / g collapsed) is ignored.
+        assert_eq!(AudioLayout::parse("M-oG(sX)").encode(), "M-osX");
+        assert_eq!(AudioLayout::parse("Og(-xM)S").encode(), "O-xMS");
+        assert_eq!(AudioLayout::parse("g(m)OSX").encode(), "mOSX");
+        assert_eq!(AudioLayout::parse("G()so").encode(), "soMX");
+        assert_eq!(AudioLayout::parse("gG(m)O").encode(), "mOSX");
+        // A stray '-' before the group marker hides nothing.
+        assert_eq!(AudioLayout::parse("-G(s)MOX").encode(), "sMOX");
+        // Old configs load through the file parser too.
+        let c = parse("{\"audio_layout\": \"G(Xs)Mo\"}").unwrap();
+        assert_eq!(c.audio_layout.order(), &[AUDIO_MIXER, AUDIO_SPATIAL, AUDIO_MASTER, AUDIO_OUTPUT]);
+        assert!(c.audio_layout.loadable(AUDIO_MIXER) && !c.audio_layout.loadable(AUDIO_SPATIAL));
+    }
+
+    #[test]
+    fn audio_layout_move_to() {
+        let mut l = AudioLayout::default();
+        assert!(!l.move_to(AUDIO_MASTER, 0));
+        assert!(!l.move_to(9, 0));
+        assert!(l.move_to(AUDIO_MASTER, 2));
+        assert_eq!(l.encode(), "OSMX");
+        assert!(l.move_to(AUDIO_MIXER, 0));
+        assert_eq!(l.encode(), "XOSM");
+        // Past the end = last.
+        assert!(l.move_to(AUDIO_OUTPUT, 99));
+        assert_eq!(l.encode(), "XSMO");
+        assert!(!l.move_to(AUDIO_OUTPUT, 3));
+        // Flags travel with the section.
+        l.toggle_hidden(AUDIO_SPATIAL);
+        l.toggle_open(AUDIO_SPATIAL);
+        assert!(l.move_to(AUDIO_SPATIAL, 3));
+        assert_eq!(l.encode(), "XMO-s");
+        assert_eq!(AudioLayout::parse(&l.encode()), l);
+    }
+
+    #[test]
+    fn audio_layout_loadable() {
+        let mut l = AudioLayout::default();
+        l.toggle_open(AUDIO_OUTPUT);
+        assert!(!l.loadable(AUDIO_OUTPUT));
+        l.toggle_open(AUDIO_OUTPUT);
+        l.toggle_hidden(AUDIO_OUTPUT);
+        assert!(!l.loadable(AUDIO_OUTPUT));
+        l.toggle_hidden(AUDIO_OUTPUT);
+        assert!(l.loadable(AUDIO_OUTPUT));
+        assert!(!l.loadable(4));
     }
 
     #[test]

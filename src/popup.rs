@@ -30,9 +30,7 @@ use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromRect, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
+use windows::Win32::Graphics::Gdi::{MonitorFromRect, ScreenToClient, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -43,7 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetTimer, SetWindowsHookExW, ShowWindow,
     UnhookWindowsHookEx, UnregisterClassW, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
     WM_XBUTTONDOWN, HTCLIENT,
-    IDC_ARROW, IDC_HAND, SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    IDC_ARROW, IDC_HAND, SW_HIDE, SW_SHOWNA, WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -246,6 +244,10 @@ pub(crate) enum Button {
 pub(crate) enum DataEvent {
     Volume(VolumeState),
     AudioOutputs(Vec<OutputDevice>),
+    /// Spatial sound formats of the default output (`None` = not supported: section hidden).
+    Spatial(Option<crate::audio::SpatialState>),
+    /// Per-app audio sessions of the default output (volume mixer rows).
+    AudioSessions(Vec<crate::audio::AppSession>),
     NotifChanged,
     TrayChanged,
     Network(crate::net::NetInfo),
@@ -347,6 +349,11 @@ struct Open {
     tracking: bool,
     fade_start: u64,
     alpha: u8,
+    /// true while the bar's show/hide animation drives this popup (`link_to_bar`): `alpha` and `dy`
+    /// come from `follow_bar`, the popup's own fade is off.
+    linked: bool,
+    /// Vertical offset (px) of the linked slide, added to `pos` when presenting; 0 otherwise.
+    dy: i32,
     /// Foreground window at open time (tick safety net).
     fg_at_open: HWND,
     /// true once the popup has been seen as the foreground window.
@@ -471,9 +478,64 @@ pub fn close(reason: &str) {
     close_inner(reason);
 }
 
+/// Links the open popup to the bar's show/hide animation (Win with `win_opens_start`): its own fade
+/// stops and `follow_bar` sets its alpha and slide on the bar's frames. false if no popup is open.
+pub fn link_to_bar() -> bool {
+    let hwnd = with(|st| {
+        let o = st.open.as_mut()?;
+        o.linked = true;
+        Some(st.hwnd)
+    })
+    .flatten();
+    let Some(hwnd) = hwnd else { return false };
+    // SAFETY: timer of our window; fails harmlessly if it is not armed.
+    let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_ANIM) };
+    true
+}
+
+/// true if the open popup follows the bar's animation (`link_to_bar`).
+pub fn is_linked() -> bool {
+    STATE.with(|s| s.try_borrow().ok().and_then(|g| g.open.as_ref().map(|o| o.linked)).unwrap_or(false))
+}
+
+/// One frame of the bar's show/hide animation (`ui::on_vis_tick`): a linked popup is presented with
+/// the bar's slide `dy` and `alpha`, without repainting. `settled` with full alpha ends the link (the
+/// show is over). No-op when nothing is linked.
+pub fn follow_bar(dy: i32, alpha: u8, settled: bool) {
+    let prepared = with(|st| {
+        let hwnd = st.hwnd;
+        let o = st.open.as_mut()?;
+        if !o.linked {
+            return None;
+        }
+        o.dy = dy;
+        o.alpha = alpha;
+        if settled && alpha == 255 {
+            o.linked = false;
+            o.dy = 0;
+        }
+        let surf = o.surf.take()?;
+        Some((hwnd, surf, o.pos))
+    })
+    .flatten();
+    let Some((hwnd, surf, pos)) = prepared else { return };
+    surf.present(hwnd, pos.0, pos.1 + dy, alpha);
+    with(|st| {
+        if let Some(o) = st.open.as_mut() {
+            o.surf = Some(surf);
+        }
+    });
+}
+
 /// true if a popup is open (the UI suspends auto-hide).
 pub fn is_open() -> bool {
     STATE.with(|s| s.try_borrow().map(|g| g.open.is_some()).unwrap_or(false))
+}
+
+/// Window of the open popup (None if no popup is open).
+pub fn current_hwnd() -> Option<HWND> {
+    let h = POPUP_HWND.load(std::sync::atomic::Ordering::Relaxed);
+    (h != 0 && is_open()).then(|| HWND(h as *mut _))
 }
 
 /// Kind of the open popup (the UI keeps the plate on the matching item).
@@ -509,6 +571,20 @@ pub fn on_volume(st: VolumeState) {
 pub fn on_audio_outputs(list: Vec<OutputDevice>) {
     if is_open() {
         dispatch(DataEvent::AudioOutputs(list));
+    }
+}
+
+/// `ShellEvent::Spatial` reached the UI. Called by `ui`.
+pub fn on_audio_spatial(state: Option<crate::audio::SpatialState>) {
+    if current() == Some(PopupKind::Audio) {
+        dispatch(DataEvent::Spatial(state));
+    }
+}
+
+/// `ShellEvent::AudioSessions` reached the UI. Called by `ui`.
+pub fn on_audio_sessions(list: Vec<crate::audio::AppSession>) {
+    if current() == Some(PopupKind::Audio) {
+        dispatch(DataEvent::AudioSessions(list));
     }
 }
 
@@ -737,13 +813,7 @@ fn ensure_window() -> Option<HWND> {
 pub(crate) fn work_area(bar: &RECT) -> RECT {
     // SAFETY: `bar` is valid; MONITOR_DEFAULTTONEAREST always returns a monitor.
     let mon = unsafe { MonitorFromRect(bar, MONITOR_DEFAULTTONEAREST) };
-    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-    // SAFETY: `mi` has the correct cbSize.
-    if unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
-        mi.rcWork
-    } else {
-        *bar
-    }
+    crate::ui::monitor_info(mon).map_or(*bar, |mi| mi.rcWork)
 }
 
 /// Top-left corner position of a `w` x `h` popup (also used by the window picker).
@@ -792,6 +862,8 @@ fn open(kind: PopupKind, anchor: Anchor) {
             tracking: false,
             fade_start: now_ms(),
             alpha: 0,
+            linked: false,
+            dy: 0,
             fg_at_open: fg,
             was_active: false,
             wheel_acc: 0,
@@ -806,8 +878,10 @@ fn open(kind: PopupKind, anchor: Anchor) {
     }
     log!("popup: opening {kind:?}");
     // No borrow during ShowWindow / force_foreground: they can deliver messages to the popup.
+    // SHOWNA: activated only by `force_foreground`. Active before its AttachThreadInput, the popup would get
+    // WA_INACTIVE from the merged input queues and close at once (first click lost when another app was in front).
     // SAFETY: `hwnd` is our popup window.
-    let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
     store_rect(&ITEM_RECT, &anchor.item);
     install_mouse_hook();
     crate::ui::force_foreground(hwnd);
@@ -892,13 +966,13 @@ fn render(relayout: bool) -> bool {
             o.pos = compute_pos(&o.anchor, w.max(1), h.max(1));
         }
         o.content.paint(&mut surf, o.hot, o.pressed);
-        Some((hwnd, surf, o.pos, o.alpha))
+        Some((hwnd, surf, o.pos, o.alpha, o.dy))
     })
     .flatten();
-    let Some((hwnd, surf, pos, alpha)) = prepared else { return false };
+    let Some((hwnd, surf, pos, alpha, dy)) = prepared else { return false };
     let (sw, sh) = surf.size();
     store_rect(&POPUP_RECT, &RECT { left: pos.0, top: pos.1, right: pos.0 + sw, bottom: pos.1 + sh });
-    let ok = surf.present(hwnd, pos.0, pos.1, alpha);
+    let ok = surf.present(hwnd, pos.0, pos.1 + dy, alpha);
     with(|st| {
         if let Some(o) = st.open.as_mut() {
             o.surf = Some(surf);
@@ -949,7 +1023,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
     match msg {
         WM_ACTIVATE => {
             if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                on_inactive();
+                // lParam: the window being activated (may be null or of another thread).
+                on_inactive(HWND(lp.0 as *mut _));
             } else {
                 mark_active(hwnd);
             }
@@ -1045,9 +1120,14 @@ fn mark_active(hwnd: HWND) {
     }
 }
 
-fn on_inactive() {
+fn on_inactive(other: HWND) {
     let kind = with(|st| st.open.as_ref().map(|o| o.kind)).flatten();
     if let Some(k) = kind {
+        // A fullscreen app bouncing the foreground back right after we took it: the UI re-takes it.
+        if crate::ui::fs_bounce_grace(other) {
+            log!("popup: focus lost to the fullscreen app's bounce: staying open");
+            return;
+        }
         with(|st| st.last_inactive = Some((k, now_ms())));
         close_inner("focus lost");
     }
@@ -1212,6 +1292,10 @@ fn on_set_cursor(hwnd: HWND) -> bool {
 fn on_anim(hwnd: HWND) {
     let done = with(|st| {
         let o = st.open.as_mut()?;
+        if o.linked {
+            // The bar's animation drives the alpha (`follow_bar`): the own fade stops here.
+            return Some(true);
+        }
         let el = now_ms().saturating_sub(o.fade_start);
         let a = ((el * 255) / FADE_MS).min(255) as u8;
         o.alpha = a;
@@ -1261,7 +1345,7 @@ fn on_tick(hwnd: HWND) {
         // Activation was seen: if the foreground is now another window, WA_INACTIVE was missed.
         // SAFETY: no preconditions.
         let fg = unsafe { GetForegroundWindow() };
-        if fg != hwnd && !fg.0.is_null() {
+        if fg != hwnd && !fg.0.is_null() && !crate::ui::fs_bounce_grace(fg) {
             close_inner("foreground changed");
             return;
         }
@@ -1275,7 +1359,7 @@ fn on_tick(hwnd: HWND) {
                     o.was_active = true;
                 }
             });
-        } else if fg != fg_at_open {
+        } else if fg != fg_at_open && !crate::ui::fs_bounce_grace(fg) {
             close_inner("foreground changed");
             return;
         }
@@ -1332,6 +1416,32 @@ pub(crate) fn hline(s: &mut Surface, x0: i32, x1: i32, y: i32) {
 /// Y coordinate to vertically center a line of height `lh` inside `rc`.
 pub(crate) fn center_y(rc: &RECT, lh: i32) -> i32 {
     rc.top + ((rc.bottom - rc.top) - lh) / 2
+}
+
+/// Track thickness of the slider shared by the popups (logical px).
+const SLIDER_TRACK_H: i32 = 4;
+
+/// Value in `lo..=hi` (rounded to the nearest step) for pointer x on slider `rc`. The center of
+/// the knob (radius `knob_r`) travels between `rc.left + knob_r` and `rc.right - knob_r`.
+/// Shared by the Settings and Audio popups.
+pub(crate) fn slider_value_at(rc: &RECT, knob_r: i32, lo: i32, hi: i32, x: i32) -> i32 {
+    let (l, r) = (rc.left + knob_r, rc.right - knob_r);
+    let span = (r - l).max(1);
+    lo + ((x - l).clamp(0, span) * (hi - lo) + span / 2) / span
+}
+
+/// Slider shared by the popups at value `v` in `lo..=hi`: dim rail across `rc`, bright fill up
+/// to the knob, white knob of radius `knob_r` (same travel as `slider_value_at`).
+pub(crate) fn paint_slider(s: &mut Surface, rc: &RECT, knob_r: i32, lo: i32, hi: i32, v: i32) {
+    use crate::surface::WHITE;
+    let (tl, tr) = (rc.left + knob_r, rc.right - knob_r);
+    let cy = (rc.top + rc.bottom) / 2;
+    let th = s.metrics().px(SLIDER_TRACK_H);
+    let rail = RECT { left: rc.left, top: cy - th / 2, right: rc.right, bottom: cy - th / 2 + th };
+    s.fill_rr(rail, th / 2, WHITE, 60);
+    let kx = tl + (tr - tl) * (v - lo) / (hi - lo).max(1);
+    s.fill_rr(RECT { right: kx, ..rail }, th / 2, WHITE, 230);
+    s.fill_rr(RECT { left: kx - knob_r, top: cy - knob_r, right: kx + knob_r, bottom: cy + knob_r }, knob_r, WHITE, 255);
 }
 
 /// Opens `target` (e.g. `ms-settings:...`) on the shell thread.
